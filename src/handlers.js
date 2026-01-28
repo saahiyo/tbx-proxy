@@ -113,12 +113,14 @@ export async function handleResolve(request, params, env) {
     size: Number(file.size),
     time: Number(file.server_mtime),
     original_url: `https://terabox.app/s/${surl}`,
+    thumb: file.thumbs?.url3 || file.thumbs?.url2 || file.thumbs?.url1 || null,
     uk: upstream.uk,
     shareid: upstream.shareid || upstream.share_id,
     fid: file.fs_id,
     stored_at: now,
     last_verified: now
   };
+  
 
   await env.SHARE_KV.put(kvKey, JSON.stringify(record));
 
@@ -166,11 +168,8 @@ streamUrl.searchParams.set('uk', uk);
   streamUrl.searchParams.set('app_id', '250528');
   streamUrl.searchParams.set('web', '1');
   streamUrl.searchParams.set('channel', 'dubox');
-  streamUrl.searchParams.set('timestamp', '1');
-  streamUrl.searchParams.set('sign', '1234');
-
-//   console.log(streamUrl.toString());
-  
+  streamUrl.searchParams.set('timestamp', '1234567890'); // required timestamp
+  streamUrl.searchParams.set('sign', 'abcd'); // required sign
 
   const res = await fetch(streamUrl.toString(), {
     headers: buildHeaders(request, {
