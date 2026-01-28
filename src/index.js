@@ -7,16 +7,12 @@ import {
 } from './handlers.js';
 import { MetricsCollector, withMetrics } from './metrics.js';
 
-// Global metrics instance
-let metricsInstance = null;
-
 export default {
   async fetch(request, env) {
     try {
-      // Initialize metrics on first request
-      if (!metricsInstance) {
-        metricsInstance = new MetricsCollector(env);
-      }
+      // Initialize and load metrics for each request
+      const metricsInstance = new MetricsCollector(env);
+      await metricsInstance.load();
 
       const url = new URL(request.url);
       const params = url.searchParams;
@@ -45,6 +41,28 @@ export default {
         );
       }
 
+      // Clear metrics endpoint (admin)
+      if (mode === 'metrics-reset') {
+        const key = params.get('key');
+        if (key === env.ADMIN_KEY || !env.ADMIN_KEY) {
+          await env.SHARE_KV.delete('metrics:current');
+          metricsInstance.metrics = {
+            requests: {},
+            errors: {},
+            cacheHits: 0,
+            cacheMisses: 0,
+            responseTimes: {},
+            upstreamErrors: 0,
+            kvOperations: { reads: 0, writes: 0, failures: 0 }
+          };
+          return Response.json(
+            { status: 'metrics cleared', timestamp: new Date().toISOString() },
+            { status: 200 }
+          );
+        }
+        return Response.json({ error: 'Unauthorized' }, { status: 401 });
+      }
+
       const startTime = performance.now();
       let response;
 
@@ -59,7 +77,7 @@ export default {
           return Response.json(
             {
               error: 'Invalid or missing mode',
-              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'health', 'metrics']
+              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'health', 'metrics', 'metrics-reset']
             },
             { status: 400 }
           );
@@ -70,9 +88,13 @@ export default {
         const duration = Math.round(performance.now() - startTime);
         metricsInstance.trackResponseTime(mode, duration);
 
+        // Save metrics to KV before returning
+        await metricsInstance.flush();
+
         return response;
       } catch (err) {
         metricsInstance.trackError(mode, err?.message || 'unknown');
+        await metricsInstance.flush();
         throw err;
       }
     } catch (err) {

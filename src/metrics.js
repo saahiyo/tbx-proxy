@@ -1,5 +1,6 @@
 /**
  * Metrics tracking for API requests, errors, cache performance, and response times
+ * Persists to KV for consistency across worker invocations
  */
 
 export class MetricsCollector {
@@ -18,6 +19,31 @@ export class MetricsCollector {
         failures: 0
       }
     };
+  }
+
+  /**
+   * Load metrics from KV storage
+   */
+  async load() {
+    try {
+      const stored = await this.env.SHARE_KV.get('metrics:current', { type: 'json' });
+      if (stored) {
+        this.metrics = stored;
+      }
+    } catch (err) {
+      console.error('Failed to load metrics from KV:', err);
+    }
+  }
+
+  /**
+   * Save metrics to KV storage
+   */
+  async save() {
+    try {
+      await this.env.SHARE_KV.put('metrics:current', JSON.stringify(this.metrics));
+    } catch (err) {
+      console.error('Failed to save metrics to KV:', err);
+    }
   }
 
   /**
@@ -134,6 +160,9 @@ export class MetricsCollector {
    * Configure endpoint in wrangler.toml: METRICS_ENDPOINT
    */
   async flush() {
+    // Always save to KV first
+    await this.save();
+
     if (!this.env.METRICS_ENDPOINT) return;
 
     try {
