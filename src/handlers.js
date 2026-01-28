@@ -50,7 +50,7 @@ export async function handleApi(request, params) {
 /**
  * Handle resolve mode - extract metadata and cache in KV
  */
-export async function handleResolve(request, params, env) {
+export async function handleResolve(request, params, env, metrics) {
   const surl = params.get('surl');
   const refresh = params.get('refresh') === '1';
   const raw = params.get('raw') === '1';
@@ -60,9 +60,16 @@ export async function handleResolve(request, params, env) {
   const kvKey = `share:${surl}`;
 
   if (!refresh && !raw) {
-    const stored = await env.SHARE_KV.get(kvKey, { type: 'json' });
-    if (stored) {
-      return Response.json({ source: 'kv', data: stored });
+    try {
+      const stored = await env.SHARE_KV.get(kvKey, { type: 'json' });
+      if (metrics) metrics.trackKvOperation('read', true);
+      if (stored) {
+        if (metrics) metrics.trackCache(true);
+        return Response.json({ source: 'kv', data: stored });
+      }
+      if (metrics) metrics.trackCache(false);
+    } catch (err) {
+      if (metrics) metrics.trackKvOperation('read', false);
     }
   }
 
@@ -94,6 +101,7 @@ export async function handleResolve(request, params, env) {
 
   const upstream = await apiRes.json();
   if (!upstream?.list?.length) {
+    if (metrics) metrics.trackUpstreamError();
     return Response.json(
       { error: 'Empty share list from upstream' },
       { status: 502 }
@@ -120,9 +128,16 @@ export async function handleResolve(request, params, env) {
     stored_at: now,
     last_verified: now
   };
-  
 
-  await env.SHARE_KV.put(kvKey, JSON.stringify(record));
+  try {
+    // KV put with TTL (7 days)
+    await env.SHARE_KV.put(kvKey, JSON.stringify(record), {
+      expirationTtl: 7 * 24 * 60 * 60
+    });
+    if (metrics) metrics.trackKvOperation('write', true);
+  } catch (err) {
+    if (metrics) metrics.trackKvOperation('write', false);
+  }
 
   return Response.json({ source: 'live', data: record });
 }
@@ -130,7 +145,7 @@ export async function handleResolve(request, params, env) {
 /**
  * Handle stream mode - returns M3U8 playlist using stored metadata
  */
-export async function handleStream(request, params, env) {
+export async function handleStream(request, params, env, metrics) {
   const surl = params.get('surl');
   const type = params.get('type') || 'M3U8_AUTO_360';
 
@@ -139,7 +154,18 @@ export async function handleStream(request, params, env) {
   }
 
   const kvKey = `share:${surl}`;
-  const record = await env.SHARE_KV.get(kvKey, { type: 'json' });
+  let record;
+  try {
+    record = await env.SHARE_KV.get(kvKey, { type: 'json' });
+    if (metrics) metrics.trackKvOperation('read', true);
+    if (record) {
+      if (metrics) metrics.trackCache(true);
+    } else {
+      if (metrics) metrics.trackCache(false);
+    }
+  } catch (err) {
+    if (metrics) metrics.trackKvOperation('read', false);
+  }
 
   if (!record) {
     return Response.json(
@@ -154,7 +180,7 @@ export async function handleStream(request, params, env) {
       { error: 'Incomplete stream metadata in KV' },
       { status: 500 }
     );
-}
+  }
 
 
 /* Build streaming URL using signed dlink params */
