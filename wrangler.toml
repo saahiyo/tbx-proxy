@@ -1,0 +1,7 @@
+name = "tbx-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+kv_namespaces = [
+  { binding = "SHARE_KV", id = "ab4f4d85c2934f92a6f83dc7c449a995" }
+]
