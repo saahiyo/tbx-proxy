@@ -3,7 +3,8 @@ import {
   handleApi,
   handleResolve,
   handleStream,
-  handleSegment
+  handleSegment,
+  handleLookup
 } from './handlers.js';
 import { MetricsCollector, withMetrics } from './metrics.js';
 
@@ -72,12 +73,13 @@ export default {
         else if (mode === 'resolve') response = await handleResolve(request, params, env, metricsInstance);
         else if (mode === 'stream') response = await handleStream(request, params, env, metricsInstance);
         else if (mode === 'segment') response = await handleSegment(request, params);
+        else if (mode === 'lookup') response = await handleLookup(request, params, env);
         else {
           metricsInstance.trackError('unknown', 'invalid_mode');
           return Response.json(
             {
               error: 'Invalid or missing mode',
-              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'health', 'metrics', 'metrics-reset']
+              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'metrics', 'metrics-reset']
             },
             { status: 400 }
           );

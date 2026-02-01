@@ -249,3 +249,77 @@ export async function handleSegment(request, params) {
     }
   });
 }
+
+/**
+ * Handle lookup mode - query D1 database directly without hitting upstream
+ * Supports lookup by share ID (surl) or file ID (fid)
+ */
+export async function handleLookup(request, params, env) {
+  const surl = params.get('surl');
+  const fid = params.get('fid');
+
+  if (!surl && !fid) {
+    return badRequest('Missing surl or fid parameter', ['surl', 'fid']);
+  }
+
+  if (!env.sharedfile) {
+    return Response.json(
+      { error: 'D1 database not configured' },
+      { status: 503 }
+    );
+  }
+
+  try {
+    // Lookup by file ID
+    if (fid) {
+      const file = await env.sharedfile
+        .prepare('SELECT * FROM media_files WHERE fs_id = ?')
+        .bind(fid)
+        .first();
+
+      if (!file) {
+        return Response.json(
+          { error: 'File not found', fid },
+          { status: 404 }
+        );
+      }
+
+      // Get thumbnails for this file
+      const thumbs = await env.sharedfile
+        .prepare('SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?')
+        .bind(fid)
+        .all();
+
+      const thumbsObj = {};
+      thumbs.results.forEach(t => {
+        thumbsObj[t.thumbnail_type] = t.url;
+      });
+
+      return Response.json({
+        source: 'd1',
+        data: { ...file, thumbs: thumbsObj }
+      });
+    }
+
+    // Lookup by share ID
+    const shareData = await getShareFromDb(env.sharedfile, surl);
+
+    if (!shareData) {
+      return Response.json(
+        { error: 'Share not found in D1. Use mode=resolve first.', surl },
+        { status: 404 }
+      );
+    }
+
+    return Response.json({
+      source: 'd1',
+      data: shareData
+    });
+  } catch (err) {
+    console.error('D1 lookup error:', err);
+    return Response.json(
+      { error: 'Database query failed', details: err.message },
+      { status: 500 }
+    );
+  }
+}
