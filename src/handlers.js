@@ -60,6 +60,7 @@ export async function handleResolve(request, params, env, metrics) {
 
   const kvKey = `share:${surl}`;
 
+  // Check KV cache first (unless refresh or raw mode)
   if (!refresh && !raw) {
     try {
       const stored = await env.SHARE_KV.get(kvKey, { type: 'json' });
@@ -74,6 +75,21 @@ export async function handleResolve(request, params, env, metrics) {
     }
   }
 
+  // For raw mode without refresh, check D1 cache first
+  if (raw && !refresh && env.sharedfile) {
+    try {
+      const d1Data = await getShareFromDb(env.sharedfile, surl);
+      if (d1Data) {
+        if (metrics) metrics.trackCache(true);
+        return Response.json({ source: 'd1', data: d1Data });
+      }
+      if (metrics) metrics.trackCache(false);
+    } catch (err) {
+      console.error('D1 cache check error:', err);
+    }
+  }
+
+  // Fetch fresh from upstream
   const pageUrl = new URL('https://www.terabox.app/sharing/link');
   pageUrl.searchParams.set('surl', surl);
 
