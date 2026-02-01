@@ -48,3 +48,35 @@ export async function jsonUpstream(res) {
     { status: res.status }
   );
 }
+
+/**
+ * Validate surl format (alphanumeric, 10-30 chars typical)
+ */
+export function isValidSurl(surl) {
+  if (!surl || typeof surl !== 'string') return false;
+  // TeraBox surls are typically alphanumeric, 10-30 characters
+  return /^[a-zA-Z0-9_-]{6,50}$/.test(surl);
+}
+
+/**
+ * Standard CORS headers for API responses
+ */
+export const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Cookie'
+};
+
+/**
+ * Add CORS headers to a response
+ */
+export function withCors(response) {
+  const headers = new Headers(response.headers);
+  Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+    headers.set(key, value);
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers
+  });
+}

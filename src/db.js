@@ -113,22 +113,103 @@ export async function saveThumbnails(db, fsId, thumbs) {
 }
 
 /**
- * Store complete upstream response in D1
+ * Store complete upstream response in D1 using batched operations
  * @param {D1Database} db - D1 database binding
  * @param {string} shareId - The share URL identifier
  * @param {object} upstream - Complete upstream API response
  */
 export async function storeUpstreamData(db, shareId, upstream) {
   try {
-    // Save share metadata
-    await saveShare(db, shareId, upstream);
+    const batch = [];
 
-    // Save all files in the list
+    // Add share metadata statement
+    batch.push(
+      db.prepare(`
+        INSERT INTO shares (share_id, uk, title, server_time, cfrom_id, errno, request_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(share_id) DO UPDATE SET
+          uk = excluded.uk,
+          title = excluded.title,
+          server_time = excluded.server_time,
+          cfrom_id = excluded.cfrom_id,
+          errno = excluded.errno,
+          request_id = excluded.request_id,
+          updated_at = CURRENT_TIMESTAMP
+      `).bind(
+        shareId,
+        upstream.uk?.toString() || null,
+        upstream.title || null,
+        upstream.server_time || null,
+        upstream.cfrom_id || null,
+        upstream.errno || 0,
+        upstream.request_id?.toString() || null
+      )
+    );
+
+    // Add all file statements
     if (upstream.list && Array.isArray(upstream.list)) {
       for (const file of upstream.list) {
-        await saveMediaFile(db, shareId, file);
+        batch.push(
+          db.prepare(`
+            INSERT INTO media_files (
+              fs_id, share_id, category, isdir, local_ctime, local_mtime,
+              md5, path, play_forbid, server_ctime, server_filename,
+              server_mtime, size, is_adult, cmd5, dlink
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(fs_id) DO UPDATE SET
+              share_id = excluded.share_id,
+              category = excluded.category,
+              md5 = excluded.md5,
+              path = excluded.path,
+              server_filename = excluded.server_filename,
+              server_mtime = excluded.server_mtime,
+              size = excluded.size,
+              is_adult = excluded.is_adult,
+              cmd5 = excluded.cmd5,
+              dlink = excluded.dlink
+          `).bind(
+            file.fs_id,
+            shareId,
+            file.category || null,
+            file.isdir || 0,
+            file.local_ctime || null,
+            file.local_mtime || null,
+            file.md5 || null,
+            file.path || null,
+            file.play_forbid || 0,
+            file.server_ctime || null,
+            file.server_filename || null,
+            file.server_mtime || null,
+            file.size ? Number(file.size) : null,
+            file.is_adult || 0,
+            file.cmd5 || null,
+            file.dlink || null
+          )
+        );
+
+        // Add thumbnail statements if present
+        if (file.thumbs) {
+          // Delete existing thumbnails for this file
+          batch.push(
+            db.prepare('DELETE FROM thumbnails WHERE fs_id = ?').bind(file.fs_id)
+          );
+          
+          const thumbnailTypes = ['url1', 'url2', 'url3', 'icon'];
+          for (const type of thumbnailTypes) {
+            if (file.thumbs[type]) {
+              batch.push(
+                db.prepare('INSERT INTO thumbnails (fs_id, url, thumbnail_type) VALUES (?, ?, ?)')
+                  .bind(file.fs_id, file.thumbs[type], type)
+              );
+            }
+          }
+        }
       }
     }
+
+    // Execute all statements in one batch
+    await db.batch(batch);
 
     return true;
   } catch (err) {

@@ -6,10 +6,19 @@ import {
   handleSegment,
   handleLookup
 } from './handlers.js';
-import { MetricsCollector, withMetrics } from './metrics.js';
+import { MetricsCollector } from './metrics.js';
+import { CORS_HEADERS, withCors } from './utils.js';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    // Handle CORS preflight requests
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: CORS_HEADERS
+      });
+    }
+
     try {
       // Initialize and load metrics for each request
       const metricsInstance = new MetricsCollector(env);
@@ -21,25 +30,25 @@ export default {
 
       // Health check endpoint
       if (mode === 'health') {
-        return Response.json(
+        return withCors(Response.json(
           {
             status: 'ok',
             timestamp: new Date().toISOString(),
             metrics: metricsInstance.getSummary()
           },
           { status: 200 }
-        );
+        ));
       }
 
       // Metrics summary endpoint
       if (mode === 'metrics') {
-        return Response.json(
+        return withCors(Response.json(
           {
             timestamp: new Date().toISOString(),
             ...metricsInstance.getSummary()
           },
           { status: 200 }
-        );
+        ));
       }
 
       // Clear metrics endpoint (admin)
@@ -56,12 +65,12 @@ export default {
             upstreamErrors: 0,
             kvOperations: { reads: 0, writes: 0, failures: 0 }
           };
-          return Response.json(
+          return withCors(Response.json(
             { status: 'metrics cleared', timestamp: new Date().toISOString() },
             { status: 200 }
-          );
+          ));
         }
-        return Response.json({ error: 'Unauthorized' }, { status: 401 });
+        return withCors(Response.json({ error: 'Unauthorized' }, { status: 401 }));
       }
 
       const startTime = performance.now();
@@ -76,13 +85,13 @@ export default {
         else if (mode === 'lookup') response = await handleLookup(request, params, env);
         else {
           metricsInstance.trackError('unknown', 'invalid_mode');
-          return Response.json(
+          return withCors(Response.json(
             {
               error: 'Invalid or missing mode',
               allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'metrics', 'metrics-reset']
             },
             { status: 400 }
-          );
+          ));
         }
 
         // Track metrics
@@ -90,20 +99,20 @@ export default {
         const duration = Math.round(performance.now() - startTime);
         metricsInstance.trackResponseTime(mode, duration);
 
-        // Save metrics to KV before returning
-        await metricsInstance.flush();
+        // Non-blocking metrics save using waitUntil
+        ctx.waitUntil(metricsInstance.flush());
 
-        return response;
+        return withCors(response);
       } catch (err) {
         metricsInstance.trackError(mode, err?.message || 'unknown');
-        await metricsInstance.flush();
+        ctx.waitUntil(metricsInstance.flush());
         throw err;
       }
     } catch (err) {
-      return Response.json(
+      return withCors(Response.json(
         { error: err?.message || 'Internal error' },
         { status: 500 }
-      );
+      ));
     }
   }
 };

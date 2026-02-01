@@ -227,12 +227,51 @@ streamUrl.searchParams.set('uk', uk);
 }
 
 /**
+ * Allowed domains for segment proxying (SSRF protection)
+ */
+const ALLOWED_SEGMENT_DOMAINS = [
+  'terabox.com',
+  'terabox.app',
+  '1024tera.com',
+  '1024terabox.com',
+  'teraboxcdn.com',
+  'dm.terabox.app',
+  'dm.1024tera.com',
+  'terasharelink.com',
+  'terafileshare.com',
+  'teraboxlink.com',
+  'teraboxshare.com'
+];
+
+/**
+ * Validate that URL belongs to an allowed TeraBox domain
+ */
+function isAllowedSegmentUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+    return ALLOWED_SEGMENT_DOMAINS.some(domain => 
+      url.hostname === domain || url.hostname.endsWith('.' + domain)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Handle segment mode - proxies video segments
  */
 export async function handleSegment(request, params) {
   const targetUrl = params.get('url');
   if (!targetUrl) {
     return Response.json({ error: 'Missing url param' }, { status: 400 });
+  }
+
+  // SSRF protection: only allow TeraBox domains
+  if (!isAllowedSegmentUrl(targetUrl)) {
+    return Response.json(
+      { error: 'Invalid segment URL: only TeraBox domains allowed' },
+      { status: 403 }
+    );
   }
 
   const res = await fetch(targetUrl, {
