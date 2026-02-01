@@ -67,7 +67,11 @@ export async function handleResolve(request, params, env, metrics) {
       if (metrics) metrics.trackKvOperation('read', true);
       if (stored) {
         if (metrics) metrics.trackCache(true);
-        return Response.json({ source: 'kv', data: stored });
+        return Response.json({
+          source: 'kv',
+          note: 'dlink requires valid TeraBox cookies to download',
+          data: stored
+        });
       }
       if (metrics) metrics.trackCache(false);
     } catch (err) {
@@ -81,7 +85,11 @@ export async function handleResolve(request, params, env, metrics) {
       const d1Data = await getShareFromDb(env.sharedfile, surl);
       if (d1Data) {
         if (metrics) metrics.trackCache(true);
-        return Response.json({ source: 'd1', data: d1Data });
+        return Response.json({
+          source: 'd1',
+          note: 'dlink requires valid TeraBox cookies to download',
+          data: d1Data
+        });
       }
       if (metrics) metrics.trackCache(false);
     } catch (err) {
@@ -135,7 +143,11 @@ export async function handleResolve(request, params, env, metrics) {
   }
 
   if (raw) {
-    return Response.json({ source: 'live', upstream });
+    return Response.json({
+      source: 'live',
+      note: 'dlink requires valid TeraBox cookies to download',
+      upstream
+    });
   }
 
   const file = upstream.list[0];
@@ -165,7 +177,11 @@ export async function handleResolve(request, params, env, metrics) {
     if (metrics) metrics.trackKvOperation('write', false);
   }
 
-  return Response.json({ source: 'live', data: record });
+  return Response.json({
+    source: 'live',
+    note: 'dlink requires valid TeraBox cookies to download',
+    data: record
+  });
 }
 
 /**
@@ -352,6 +368,7 @@ export async function handleLookup(request, params, env) {
 
       return Response.json({
         source: 'd1',
+        note: 'dlink requires valid TeraBox cookies to download',
         data: { ...file, thumbs: thumbsObj }
       });
     }
@@ -368,6 +385,7 @@ export async function handleLookup(request, params, env) {
 
     return Response.json({
       source: 'd1',
+      note: 'dlink requires valid TeraBox cookies to download',
       data: shareData
     });
   } catch (err) {

@@ -256,6 +256,8 @@ curl -o video.mp4 "$DLINK"
 
 ## Tips
 
+⚠️ **dlink requires cookies** — The download link won't work without valid TeraBox cookies passed in headers
+
 ✅ **Always call `resolve` first** before using `stream`
 
 ✅ **Use `lookup` for fast queries** — no upstream calls

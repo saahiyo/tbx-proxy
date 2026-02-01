@@ -130,6 +130,8 @@ GET /?mode=resolve&surl=<shorturl>[&refresh=1][&raw=1]
 }
 ```
 
+> ⚠️ **Important:** The `dlink` (download link) requires valid TeraBox cookies to work. Pass cookies in the `Cookie` header when making download requests.
+
 ---
 
 #### Mode: `lookup`
