@@ -109,6 +109,15 @@ export async function handleResolve(request, params, env, metrics) {
     );
   }
 
+  // Store complete data in D1 for persistence (always, regardless of raw mode)
+  try {
+    if (env.sharedfile) {
+      await storeUpstreamData(env.sharedfile, surl, upstream);
+    }
+  } catch (err) {
+    console.error('D1 storage error:', err);
+  }
+
   if (raw) {
     return Response.json({ source: 'live', upstream });
   }
@@ -138,15 +147,6 @@ export async function handleResolve(request, params, env, metrics) {
     if (metrics) metrics.trackKvOperation('write', true);
   } catch (err) {
     if (metrics) metrics.trackKvOperation('write', false);
-  }
-
-  // Store complete data in D1 for persistence and analytics
-  try {
-    if (env.sharedfile) {
-      await storeUpstreamData(env.sharedfile, surl, upstream);
-    }
-  } catch (err) {
-    console.error('D1 storage error:', err);
   }
 
   return Response.json({ source: 'live', data: record });
