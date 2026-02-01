@@ -69,7 +69,7 @@ export async function handleResolve(request, params, env, metrics) {
         if (metrics) metrics.trackCache(true);
         return Response.json({
           source: 'kv',
-          note: 'dlink requires valid TeraBox cookies to download',
+          ...(!stored.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
           data: stored
         });
       }
@@ -85,9 +85,10 @@ export async function handleResolve(request, params, env, metrics) {
       const d1Data = await getShareFromDb(env.sharedfile, surl);
       if (d1Data) {
         if (metrics) metrics.trackCache(true);
+        const hasDlink = d1Data.list?.some(f => f.dlink) || false;
         return Response.json({
           source: 'd1',
-          note: 'dlink requires valid TeraBox cookies to download',
+          ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
           data: d1Data
         });
       }
@@ -143,9 +144,10 @@ export async function handleResolve(request, params, env, metrics) {
   }
 
   if (raw) {
+    const hasDlink = upstream.list?.some(f => f.dlink) || false;
     return Response.json({
       source: 'live',
-      note: 'dlink requires valid TeraBox cookies to download',
+      ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
       upstream
     });
   }
@@ -179,7 +181,7 @@ export async function handleResolve(request, params, env, metrics) {
 
   return Response.json({
     source: 'live',
-    note: 'dlink requires valid TeraBox cookies to download',
+    ...(!record.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
     data: record
   });
 }
@@ -368,7 +370,7 @@ export async function handleLookup(request, params, env) {
 
       return Response.json({
         source: 'd1',
-        note: 'dlink requires valid TeraBox cookies to download',
+        ...(!file.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
         data: { ...file, thumbs: thumbsObj }
       });
     }
@@ -383,9 +385,10 @@ export async function handleLookup(request, params, env) {
       );
     }
 
+    const hasDlink = shareData.list?.some(f => f.dlink) || false;
     return Response.json({
       source: 'd1',
-      note: 'dlink requires valid TeraBox cookies to download',
+      ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
       data: shareData
     });
   } catch (err) {
