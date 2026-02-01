@@ -6,6 +6,11 @@ kv_namespaces = [
   { binding = "SHARE_KV", id = "ab4f4d85c2934f92a6f83dc7c449a995" }
 ]
 
+[[d1_databases]]
+binding = "sharedfile"
+database_name = "sharedfile"
+database_id = "209a51f1-614b-435d-846c-b60b2bbc9b75"
+
 [observability]
 [observability.logs]
 enabled = true

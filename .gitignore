@@ -9,3 +9,5 @@ lerna-debug.log*
 .wrangler
 node_modules
 .DS_Store
+test_endpoints.py
+debug_page.html
