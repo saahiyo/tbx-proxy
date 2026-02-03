@@ -4,10 +4,24 @@ import {
   handleResolve,
   handleStream,
   handleSegment,
-  handleLookup
+  handleLookup,
+  handleAdminOverview,
+  handleAdminShares,
+  handleAdminShareDetail,
+  handleAdminFiles,
+  handleAdminFileDetail,
+  handleAdminThumbnails,
+  handleAdminAnalyticsProcessed,
+  handleAdminKvEntry,
+  handleAdminKvStats
 } from './handlers.js';
 import { MetricsCollector } from './metrics.js';
 import { CORS_HEADERS, withCors } from './utils.js';
+
+function isAdminAuthorized(url, request, env) {
+  const key = url.searchParams.get('key') || request.headers.get('x-admin-key');
+  return !env.ADMIN_KEY || key === env.ADMIN_KEY;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -27,6 +41,56 @@ export default {
       const url = new URL(request.url);
       const params = url.searchParams;
       const mode = params.get('mode');
+
+      // Admin routes (path-based)
+      if (url.pathname.startsWith('/admin')) {
+        if (!isAdminAuthorized(url, request, env)) {
+          return withCors(Response.json({ error: 'Unauthorized' }, { status: 401 }));
+        }
+
+        const startTime = performance.now();
+        let response;
+
+        try {
+          if (url.pathname === '/admin/overview') {
+            response = await handleAdminOverview(request, params, env);
+          } else if (url.pathname === '/admin/shares') {
+            response = await handleAdminShares(request, params, env);
+          } else if (url.pathname.startsWith('/admin/shares/')) {
+            const shareId = decodeURIComponent(url.pathname.replace('/admin/shares/', ''));
+            response = await handleAdminShareDetail(request, params, env, shareId);
+          } else if (url.pathname === '/admin/files') {
+            response = await handleAdminFiles(request, params, env);
+          } else if (url.pathname.startsWith('/admin/files/')) {
+            const fsId = decodeURIComponent(url.pathname.replace('/admin/files/', ''));
+            response = await handleAdminFileDetail(request, params, env, fsId);
+          } else if (url.pathname === '/admin/thumbnails') {
+            response = await handleAdminThumbnails(request, params, env);
+          } else if (url.pathname === '/admin/analytics/processed') {
+            response = await handleAdminAnalyticsProcessed(request, params, env);
+          } else if (url.pathname === '/admin/kv/entry') {
+            response = await handleAdminKvEntry(request, params, env);
+          } else if (url.pathname === '/admin/kv/stats') {
+            response = await handleAdminKvStats(request, params, env);
+          } else {
+            return withCors(Response.json({ error: 'Not found' }, { status: 404 }));
+          }
+
+          metricsInstance.trackRequest('admin');
+          const duration = Math.round(performance.now() - startTime);
+          metricsInstance.trackResponseTime('admin', duration);
+          ctx.waitUntil(metricsInstance.flush());
+
+          return withCors(response);
+        } catch (err) {
+          metricsInstance.trackError('admin', err?.message || 'unknown');
+          ctx.waitUntil(metricsInstance.flush());
+          return withCors(Response.json(
+            { error: err?.message || 'Internal error' },
+            { status: 500 }
+          ));
+        }
+      }
 
       // Health check endpoint
       if (mode === 'health') {
@@ -88,7 +152,7 @@ export default {
           return withCors(Response.json(
             {
               error: 'Invalid or missing mode',
-              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'metrics', 'metrics-reset']
+              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'metrics', 'metrics-reset', 'admin/*']
             },
             { status: 400 }
           ));

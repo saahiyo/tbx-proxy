@@ -1,0 +1,116 @@
+[PRD: TBX-Proxy API]
+
+1. Overview
+- Product Name: TBX-Proxy API
+- Purpose: A Cloudflare Workers proxy for TeraBox shares that resolves metadata, enables streaming via M3U8, and caches data in KV and D1 for performance.
+- Primary Users: Developers building tools, dashboards, or streaming interfaces for TeraBox content.
+- Scope: Worker API only (no frontend).
+
+2. Goals
+- Provide reliable access to TeraBox share metadata via a simple GET API.
+- Support video streaming with M3U8 playlist generation and segment proxying.
+- Improve performance with KV and D1 caching.
+- Offer basic observability through API metrics endpoints.
+
+3. Non-Goals
+- Bypassing TeraBox authentication or access restrictions.
+- Full download support without user-supplied cookies.
+- Multi-user auth or account system.
+- UI/UX design for dashboards (covered in separate Admin Dashboard PRD).
+
+4. Success Metrics
+- Median resolve latency under 500ms (cached under 20ms).
+- Cache hit rate above 60% for active shares.
+- Stream playlist response rate above 99%.
+- Error rate below 1% (non-2xx responses).
+
+5. Functional Requirements
+
+5.1 Base Behavior
+- All requests use HTTP GET.
+- CORS enabled for browser access.
+- Consistent JSON error responses.
+
+5.2 Modes and Parameters
+
+Mode: resolve
+- Required: surl
+- Optional: refresh=1, raw=1
+- Behavior:
+  - Uses KV unless refresh=1 or raw=1.
+  - If raw=1 and D1 configured, checks D1 first.
+  - If upstream fetch occurs, store full data in D1.
+- Output:
+  - Normal: { source, data }
+  - Raw: { source, upstream }
+
+Mode: lookup
+- Required: surl or fid
+- Behavior: D1-only lookup, no upstream calls.
+- Output: { source: d1, data }
+
+Mode: stream
+- Required: surl
+- Optional: type (default M3U8_AUTO_360)
+- Behavior: Requires KV record; generates M3U8 playlist with rewritten segment URLs.
+- Output: M3U8 playlist
+
+Mode: segment
+- Required: url
+- Behavior: Proxies segment only if hostname is on allowlist.
+- Output: Raw segment bytes
+
+Mode: page
+- Required: surl
+- Behavior: Fetches share HTML from TeraBox.
+- Output: HTML
+
+Mode: api
+- Required: jsToken, shorturl
+- Behavior: Direct TeraBox API call.
+- Output: JSON
+
+Mode: health
+- Output: status, timestamp, metrics summary
+
+Mode: metrics
+- Output: detailed metrics summary
+
+Mode: metrics-reset
+- Optional: key
+- Behavior: Clears metrics if key matches ADMIN_KEY or ADMIN_KEY is unset.
+
+6. Data & Storage Requirements
+- KV Namespace SHARE_KV:
+  - share:<surl> for cached resolve data
+  - metrics:current for metrics persistence
+- D1 Database sharedfile:
+  - shares, media_files, thumbnails tables
+
+7. Security & Compliance
+- SSRF protection in segment mode via allowlisted domains.
+- CORS headers on all responses.
+- Cookies required for dlink downloads; proxy does not store cookies.
+
+8. Reliability & Performance
+- KV TTL: 7 days for resolve cache.
+- D1 is persistent and used for lookup/raw.
+- Metrics write on each request (best effort).
+
+9. Observability
+- /?mode=metrics for summarized stats.
+- /?mode=health for health check + summary.
+- Optional METRICS_ENDPOINT support.
+
+10. Error Handling
+- 400 for missing params
+- 403 for token extraction or SSRF block
+- 404 for missing cache entries
+- 500 for internal/metadata issues
+- 502 for upstream errors
+- 503 when D1 not configured
+
+11. Open Questions
+- Should errors count all non-2xx responses or only thrown exceptions?
+- Should metrics be time-windowed (last 24h) to align with CF dashboard?
+

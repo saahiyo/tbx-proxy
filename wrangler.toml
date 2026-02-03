@@ -15,3 +15,6 @@ database_id = "209a51f1-614b-435d-846c-b60b2bbc9b75"
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+[vars]
+ADMIN_KEY = "developer000"

@@ -1,0 +1,170 @@
+[PRD: TBX-Proxy Admin Dashboard (Data-Centric)]
+
+1. Overview
+- Product Name: TBX-Proxy Admin Dashboard
+- Purpose: Operate TBX-Proxy by inspecting D1 stored data, KV cache, and processed link activity at scale.
+- Primary Users: Operator/admin (you).
+- Scope: Data-centric analytics with admin actions; metrics/health are secondary.
+
+2. Goals
+- Provide deep visibility into D1 tables (shares, media_files, thumbnails).
+- Expose KV cache status, TTL behavior, and hit/miss impact.
+- Track how many links are processed over time and their outcomes.
+- Enable quick investigation of specific shares/files.
+
+3. Non-Goals
+- Full log search or distributed tracing.
+- End-user authentication system.
+- Billing or quota management.
+
+4. Success Metrics
+- Admin can find a share/file in under 10 seconds.
+- Admin can see total processed links and growth trend in under 30 seconds.
+- Dashboard loads initial data in under 2 seconds.
+
+5. Data Sources (Primary)
+- D1 database: shares, media_files, thumbnails
+- KV: share:<surl> cache entries, metrics:current (optional/secondary)
+- Optional: Worker metrics/health endpoints (secondary context only)
+
+5.1 Data Access Endpoints (Live in Worker)
+All admin endpoints require `key` query param or `x-admin-key` header that matches `ADMIN_KEY`.
+If `ADMIN_KEY` is unset, endpoints are open.
+
+- GET /admin/overview
+  - D1:
+    - SELECT COUNT(*) as total FROM shares
+    - SELECT COUNT(*) as total FROM media_files
+    - SELECT COUNT(*) as total FROM thumbnails
+    - SELECT share_id, title, updated_at FROM shares ORDER BY updated_at DESC LIMIT 20
+  - Response: { counts, latestShares }
+
+- GET /admin/shares
+  - Params: q, sort=updated_at|server_time|title, order=asc|desc, page, pageSize
+  - D1:
+    - SELECT COUNT(*) as total FROM shares WHERE share_id LIKE ? OR title LIKE ? OR uk LIKE ?
+    - SELECT share_id, uk, title, server_time, request_id, updated_at
+      FROM shares ... ORDER BY <sort> <order> LIMIT ? OFFSET ?
+  - Response: { page, pageSize, total, items }
+
+- GET /admin/shares/:share_id
+  - Params: page, pageSize
+  - D1:
+    - SELECT * FROM shares WHERE share_id = ?
+    - SELECT COUNT(*) as total FROM media_files WHERE share_id = ?
+    - SELECT * FROM media_files WHERE share_id = ? ORDER BY server_mtime DESC LIMIT ? OFFSET ?
+    - SELECT fs_id, url, thumbnail_type FROM thumbnails WHERE fs_id IN (...)
+  - Response: { share, files, thumbsByFsId, page, pageSize, totalFiles }
+
+- GET /admin/files
+  - Params: q, share_id, size_min, size_max, sort=server_mtime|size|server_filename, order=asc|desc, page, pageSize
+  - D1:
+    - SELECT COUNT(*) as total FROM media_files WHERE ...
+    - SELECT * FROM media_files WHERE ... ORDER BY <sort> <order> LIMIT ? OFFSET ?
+  - Response: { page, pageSize, total, items }
+
+- GET /admin/files/:fs_id
+  - D1:
+    - SELECT * FROM media_files WHERE fs_id = ?
+    - SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?
+  - Response: { file, thumbs }
+
+- GET /admin/thumbnails
+  - Params: fs_id, type, page, pageSize
+  - D1:
+    - SELECT COUNT(*) as total FROM thumbnails WHERE ...
+    - SELECT * FROM thumbnails WHERE ... ORDER BY id DESC LIMIT ? OFFSET ?
+  - Response: { page, pageSize, total, items }
+
+- GET /admin/analytics/processed
+  - Params: limit (default 30)
+  - D1:
+    - SELECT DATE(updated_at) as day, COUNT(*) as shares
+      FROM shares GROUP BY day ORDER BY day DESC LIMIT ?
+  - Response: { limit, items }
+
+- GET /admin/kv/entry
+  - Params: surl
+  - KV:
+    - GET share:<surl>
+  - Response: { surl, data } or 404
+
+- GET /admin/kv/stats
+  - KV:
+    - GET metrics:current
+  - Response: { metrics, note }
+
+5.2 Optional Admin Actions
+- GET /?mode=metrics-reset&key=ADMIN_KEY (existing worker endpoint)
+
+6. Core Views (Data-First)
+
+6.1 D1 Overview
+- Total shares count
+- Total media_files count
+- Total thumbnails count
+- Latest shares added (table view)
+- Growth chart: shares added per day/week
+
+6.2 Shares Explorer
+- Search by share_id (surl), uk, title, request_id
+- Sort by updated_at, server_time
+- View share details and associated files
+- Quick link to resolve/stream URLs
+
+6.3 Media Files Explorer
+- Search by fs_id, share_id, filename, size range
+- Sort by size, server_mtime, local_mtime
+- Show dlink availability and thumbnail presence
+- File detail view with all fields
+
+6.4 Thumbnails Explorer
+- Search by fs_id
+- Count by thumbnail_type
+- Presence rate per media file
+
+6.5 KV Cache View
+- Total KV entries (approximate if enumerated)
+- Hit/miss counters from metrics (secondary)
+- KV write failures (secondary)
+- KV TTL policy (static info: 7 days)
+- Example cache entry preview by surl
+
+6.6 Processed Links Analytics
+- Total unique shares processed (D1 shares count)
+- Total requests processed (optional from metrics)
+- Resolve requests vs stream requests (optional)
+- Daily/weekly processed shares (from D1 updated_at)
+
+6.7 Errors & Failures (Secondary)
+- Upstream error count (if tracked)
+- Frequent failure patterns (from error counters if available)
+
+7. Admin Actions
+- Metrics reset (calls /?mode=metrics-reset&key=ADMIN_KEY)
+- D1 maintenance (future): delete stale shares, prune thumbnails
+
+8. UX Requirements
+- Primary navigation: D1 Overview, Shares, Media Files, Thumbnails, KV, Analytics, Errors
+- Fast search with pagination
+- Table views with sortable columns
+- Detail drawer or page for share/file
+
+9. Security Requirements
+- Admin key required for sensitive actions (metrics reset, deletes).
+- Optional Cloudflare Access for dashboard route.
+
+10. Technical Requirements
+- Use D1 queries for counts and filtered lists.
+- Pagination for tables (page size 25/50/100).
+- Background refresh for counts (every 60s).
+- Cache query results on client for smoother navigation.
+
+11. Edge Cases
+- D1 not configured: show blocking warning for data views.
+- KV not configured: KV views disabled.
+- Large tables: require pagination and indexed queries.
+
+12. Open Questions
+- Should we add time-series storage for processed links?
+- Do we need per-share audit history?

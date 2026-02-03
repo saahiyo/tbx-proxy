@@ -399,3 +399,358 @@ export async function handleLookup(request, params, env) {
     );
   }
 }
+
+function parsePositiveInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  if (Number.isNaN(n) || n <= 0) return fallback;
+  return n;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeOrder(order) {
+  return order && order.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+}
+
+function normalizeSort(sort, allowed, fallback) {
+  return allowed.includes(sort) ? sort : fallback;
+}
+
+function requireD1(env) {
+  if (!env.sharedfile) {
+    return Response.json(
+      { error: 'D1 database not configured' },
+      { status: 503 }
+    );
+  }
+  return null;
+}
+
+function requireKv(env) {
+  if (!env.SHARE_KV) {
+    return Response.json(
+      { error: 'KV namespace not configured' },
+      { status: 503 }
+    );
+  }
+  return null;
+}
+
+export async function handleAdminOverview(request, params, env) {
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const sharesCount = await env.sharedfile
+    .prepare('SELECT COUNT(*) as total FROM shares')
+    .first();
+  const filesCount = await env.sharedfile
+    .prepare('SELECT COUNT(*) as total FROM media_files')
+    .first();
+  const thumbsCount = await env.sharedfile
+    .prepare('SELECT COUNT(*) as total FROM thumbnails')
+    .first();
+  const latestShares = await env.sharedfile
+    .prepare('SELECT share_id, title, updated_at FROM shares ORDER BY updated_at DESC LIMIT 20')
+    .all();
+
+  return Response.json({
+    counts: {
+      shares: sharesCount?.total || 0,
+      media_files: filesCount?.total || 0,
+      thumbnails: thumbsCount?.total || 0
+    },
+    latestShares: latestShares?.results || []
+  });
+}
+
+export async function handleAdminShares(request, params, env) {
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const q = params.get('q')?.trim();
+  const sort = normalizeSort(params.get('sort'), ['updated_at', 'server_time', 'title'], 'updated_at');
+  const order = normalizeOrder(params.get('order'));
+  const page = parsePositiveInt(params.get('page'), 1);
+  const pageSize = clamp(parsePositiveInt(params.get('pageSize'), 50), 1, 200);
+  const offset = (page - 1) * pageSize;
+
+  const where = q ? 'WHERE share_id LIKE ? OR title LIKE ? OR uk LIKE ?' : '';
+  const binds = [];
+  if (q) {
+    const like = `%${q}%`;
+    binds.push(like, like, like);
+  }
+
+  const totalRow = await env.sharedfile
+    .prepare(`SELECT COUNT(*) as total FROM shares ${where}`)
+    .bind(...binds)
+    .first();
+
+  const list = await env.sharedfile
+    .prepare(
+      `SELECT share_id, uk, title, server_time, request_id, updated_at
+       FROM shares ${where}
+       ORDER BY ${sort} ${order}
+       LIMIT ? OFFSET ?`
+    )
+    .bind(...binds, pageSize, offset)
+    .all();
+
+  return Response.json({
+    page,
+    pageSize,
+    total: totalRow?.total || 0,
+    items: list?.results || []
+  });
+}
+
+export async function handleAdminShareDetail(request, params, env, shareId) {
+  if (!shareId) return badRequest('Missing share_id');
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const share = await env.sharedfile
+    .prepare('SELECT * FROM shares WHERE share_id = ?')
+    .bind(shareId)
+    .first();
+
+  if (!share) {
+    return Response.json({ error: 'Share not found', share_id: shareId }, { status: 404 });
+  }
+
+  const page = parsePositiveInt(params.get('page'), 1);
+  const pageSize = clamp(parsePositiveInt(params.get('pageSize'), 50), 1, 200);
+  const offset = (page - 1) * pageSize;
+
+  const totalFilesRow = await env.sharedfile
+    .prepare('SELECT COUNT(*) as total FROM media_files WHERE share_id = ?')
+    .bind(shareId)
+    .first();
+
+  const files = await env.sharedfile
+    .prepare(
+      `SELECT * FROM media_files
+       WHERE share_id = ?
+       ORDER BY server_mtime DESC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(shareId, pageSize, offset)
+    .all();
+
+  const fileIds = (files?.results || []).map(f => f.fs_id).filter(Boolean);
+  let thumbsByFsId = {};
+  if (fileIds.length > 0 && fileIds.length <= 200) {
+    const placeholders = fileIds.map(() => '?').join(',');
+    const thumbs = await env.sharedfile
+      .prepare(`SELECT fs_id, url, thumbnail_type FROM thumbnails WHERE fs_id IN (${placeholders})`)
+      .bind(...fileIds)
+      .all();
+
+    thumbsByFsId = {};
+    (thumbs?.results || []).forEach(t => {
+      if (!thumbsByFsId[t.fs_id]) thumbsByFsId[t.fs_id] = {};
+      thumbsByFsId[t.fs_id][t.thumbnail_type] = t.url;
+    });
+  }
+
+  return Response.json({
+    share,
+    files: files?.results || [],
+    thumbsByFsId,
+    page,
+    pageSize,
+    totalFiles: totalFilesRow?.total || 0
+  });
+}
+
+export async function handleAdminFiles(request, params, env) {
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const q = params.get('q')?.trim();
+  const shareId = params.get('share_id')?.trim();
+  const sizeMin = params.get('size_min');
+  const sizeMax = params.get('size_max');
+  const sort = normalizeSort(params.get('sort'), ['server_mtime', 'size', 'server_filename'], 'server_mtime');
+  const order = normalizeOrder(params.get('order'));
+  const page = parsePositiveInt(params.get('page'), 1);
+  const pageSize = clamp(parsePositiveInt(params.get('pageSize'), 50), 1, 200);
+  const offset = (page - 1) * pageSize;
+
+  const whereParts = [];
+  const binds = [];
+
+  if (shareId) {
+    whereParts.push('share_id = ?');
+    binds.push(shareId);
+  }
+  if (q) {
+    whereParts.push('(server_filename LIKE ? OR fs_id LIKE ?)');
+    const like = `%${q}%`;
+    binds.push(like, like);
+  }
+  if (sizeMin) {
+    whereParts.push('size >= ?');
+    binds.push(Number(sizeMin));
+  }
+  if (sizeMax) {
+    whereParts.push('size <= ?');
+    binds.push(Number(sizeMax));
+  }
+
+  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+  const totalRow = await env.sharedfile
+    .prepare(`SELECT COUNT(*) as total FROM media_files ${where}`)
+    .bind(...binds)
+    .first();
+
+  const list = await env.sharedfile
+    .prepare(
+      `SELECT * FROM media_files ${where}
+       ORDER BY ${sort} ${order}
+       LIMIT ? OFFSET ?`
+    )
+    .bind(...binds, pageSize, offset)
+    .all();
+
+  return Response.json({
+    page,
+    pageSize,
+    total: totalRow?.total || 0,
+    items: list?.results || []
+  });
+}
+
+export async function handleAdminFileDetail(request, params, env, fsId) {
+  if (!fsId) return badRequest('Missing fs_id');
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const file = await env.sharedfile
+    .prepare('SELECT * FROM media_files WHERE fs_id = ?')
+    .bind(fsId)
+    .first();
+
+  if (!file) {
+    return Response.json({ error: 'File not found', fs_id: fsId }, { status: 404 });
+  }
+
+  const thumbs = await env.sharedfile
+    .prepare('SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?')
+    .bind(fsId)
+    .all();
+
+  const thumbsObj = {};
+  (thumbs?.results || []).forEach(t => {
+    thumbsObj[t.thumbnail_type] = t.url;
+  });
+
+  return Response.json({
+    file,
+    thumbs: thumbsObj
+  });
+}
+
+export async function handleAdminThumbnails(request, params, env) {
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const fsId = params.get('fs_id')?.trim();
+  const type = params.get('type')?.trim();
+  const page = parsePositiveInt(params.get('page'), 1);
+  const pageSize = clamp(parsePositiveInt(params.get('pageSize'), 50), 1, 200);
+  const offset = (page - 1) * pageSize;
+
+  const whereParts = [];
+  const binds = [];
+
+  if (fsId) {
+    whereParts.push('fs_id = ?');
+    binds.push(fsId);
+  }
+  if (type) {
+    whereParts.push('thumbnail_type = ?');
+    binds.push(type);
+  }
+
+  const where = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+  const totalRow = await env.sharedfile
+    .prepare(`SELECT COUNT(*) as total FROM thumbnails ${where}`)
+    .bind(...binds)
+    .first();
+
+  const list = await env.sharedfile
+    .prepare(
+      `SELECT * FROM thumbnails ${where}
+       ORDER BY id DESC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(...binds, pageSize, offset)
+    .all();
+
+  return Response.json({
+    page,
+    pageSize,
+    total: totalRow?.total || 0,
+    items: list?.results || []
+  });
+}
+
+export async function handleAdminAnalyticsProcessed(request, params, env) {
+  const missing = requireD1(env);
+  if (missing) return missing;
+
+  const limit = clamp(parsePositiveInt(params.get('limit'), 30), 1, 180);
+  const rows = await env.sharedfile
+    .prepare(
+      `SELECT DATE(updated_at) as day, COUNT(*) as shares
+       FROM shares
+       GROUP BY day
+       ORDER BY day DESC
+       LIMIT ?`
+    )
+    .bind(limit)
+    .all();
+
+  return Response.json({
+    limit,
+    items: rows?.results || []
+  });
+}
+
+export async function handleAdminKvEntry(request, params, env) {
+  const missing = requireKv(env);
+  if (missing) return missing;
+
+  const surl = params.get('surl');
+  if (!surl) return badRequest('Missing surl');
+
+  try {
+    const record = await env.SHARE_KV.get(`share:${surl}`, { type: 'json' });
+    if (!record) {
+      return Response.json({ error: 'KV entry not found', surl }, { status: 404 });
+    }
+    return Response.json({ surl, data: record });
+  } catch (err) {
+    return Response.json({ error: 'KV read failed', details: err.message }, { status: 500 });
+  }
+}
+
+export async function handleAdminKvStats(request, params, env) {
+  const missing = requireKv(env);
+  if (missing) return missing;
+
+  try {
+    const metrics = await env.SHARE_KV.get('metrics:current', { type: 'json' });
+    return Response.json({
+      metrics: metrics || null,
+      note: 'KV does not support listing all keys; stats are derived from stored metrics only.'
+    });
+  } catch (err) {
+    return Response.json({ error: 'KV read failed', details: err.message }, { status: 500 });
+  }
+}
