@@ -268,6 +268,7 @@ const ALLOWED_SEGMENT_DOMAINS = [
   'terabox.app',
   '1024tera.com',
   '1024terabox.com',
+  'freeterabox.com',
   'teraboxcdn.com',
   'dm.terabox.app',
   'dm.1024tera.com',
