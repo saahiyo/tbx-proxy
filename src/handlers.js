@@ -212,10 +212,30 @@ export async function handleStream(request, params, env, metrics) {
   }
 
   if (!record) {
-    return Response.json(
-      { error: 'Share not found in KV. Call mode=resolve first.' },
-      { status: 404 }
-    );
+    // Auto-resolve on cache miss to populate KV
+    const resolveRes = await handleResolve(request, params, env, metrics);
+    if (!resolveRes.ok) {
+      return resolveRes;
+    }
+
+    try {
+      record = await env.SHARE_KV.get(kvKey, { type: 'json' });
+      if (metrics) metrics.trackKvOperation('read', true);
+      if (record) {
+        if (metrics) metrics.trackCache(true);
+      } else {
+        if (metrics) metrics.trackCache(false);
+      }
+    } catch (err) {
+      if (metrics) metrics.trackKvOperation('read', false);
+    }
+
+    if (!record) {
+      return Response.json(
+        { error: 'Share not found in KV after resolve attempt.' },
+        { status: 404 }
+      );
+    }
   }
 
   const { uk, shareid, fid, dlink } = record;
