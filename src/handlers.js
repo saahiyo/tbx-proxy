@@ -6,6 +6,39 @@ import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, er
 import { rewriteM3U8 } from './m3u8.js';
 import { storeUpstreamData, getShareFromDb } from './db.js';
 
+function hashString(input) {
+  let hash = 5381;
+  for (let i = 0; i < input.length; i++) {
+    hash = ((hash << 5) + hash) + input.charCodeAt(i);
+    hash = hash & 0xffffffff;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function isTransientStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+async function fetchWithRetry(url, options, retries = 2, baseDelayMs = 200) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok || !isTransientStatus(res.status) || attempt === retries) {
+        return res;
+      }
+      lastErr = new Error(`Transient upstream status: ${res.status}`);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === retries) throw err;
+    }
+
+    const delay = baseDelayMs * Math.pow(2, attempt);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  throw lastErr || new Error('Upstream request failed');
+}
+
 /**
  * Handle page mode - fetches the share page
  */
@@ -99,35 +132,93 @@ export async function handleResolve(request, params, env, metrics) {
   }
 
   // Fetch fresh from upstream
-  const pageUrl = new URL('https://www.terabox.app/sharing/link');
-  pageUrl.searchParams.set('surl', surl);
+  const cookie = request.headers.get('Cookie') || '';
+  const tokenKey = env.SHARE_KV
+    ? `token:${surl}:${cookie ? hashString(cookie) : 'anon'}`
+    : null;
 
-  const pageRes = await fetch(pageUrl.toString(), {
-    headers: buildHeaders(request, { Accept: 'text/html' }),
-    redirect: 'follow'
+  const apiHeaders = buildHeaders(request, {
+    Accept: 'application/json',
+    Referer: 'https://terabox.com/'
   });
 
-  if (!pageRes.ok) {
-    if (metrics) metrics.trackUpstreamError();
-    return errorJson(502, 'Upstream page request failed', 'upstream_error', {
-      status: pageRes.status
-    });
+  async function fetchApiWithToken(jsToken) {
+    const apiUrl = buildApiUrl(jsToken, surl, '1');
+    return fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200);
   }
 
-  const html = await pageRes.text();
-  const jsToken = extractJsToken(html);
-
-  if (!jsToken) {
-    return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
+  let jsToken = null;
+  if (tokenKey) {
+    try {
+      jsToken = await env.SHARE_KV.get(tokenKey);
+    } catch {
+      jsToken = null;
+    }
   }
 
-  const apiUrl = buildApiUrl(jsToken, surl, '1');
-  const apiRes = await fetch(apiUrl, {
-    headers: buildHeaders(request, {
-      Accept: 'application/json',
-      Referer: 'https://terabox.com/'
-    })
-  });
+  let apiRes;
+  if (jsToken) {
+    try {
+      apiRes = await fetchApiWithToken(jsToken);
+    } catch (err) {
+      if (metrics) metrics.trackUpstreamError();
+      return errorJson(502, 'Upstream API request failed', 'upstream_error', err?.message || 'network_error');
+    }
+    if (apiRes.status === 401 || apiRes.status === 403) {
+      try {
+        await env.SHARE_KV.delete(tokenKey);
+      } catch {
+        // ignore
+      }
+      jsToken = null;
+      apiRes = null;
+    }
+  }
+
+  if (!apiRes) {
+    const pageUrl = new URL('https://www.terabox.app/sharing/link');
+    pageUrl.searchParams.set('surl', surl);
+
+    let pageRes;
+    try {
+      pageRes = await fetchWithRetry(pageUrl.toString(), {
+        headers: buildHeaders(request, { Accept: 'text/html' }),
+        redirect: 'follow'
+      }, 2, 200);
+    } catch (err) {
+      if (metrics) metrics.trackUpstreamError();
+      return errorJson(502, 'Upstream page request failed', 'upstream_error', err?.message || 'network_error');
+    }
+
+    if (!pageRes.ok) {
+      if (metrics) metrics.trackUpstreamError();
+      return errorJson(502, 'Upstream page request failed', 'upstream_error', {
+        status: pageRes.status
+      });
+    }
+
+    const html = await pageRes.text();
+    jsToken = extractJsToken(html);
+
+    if (!jsToken) {
+      return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
+    }
+
+    if (tokenKey) {
+      try {
+        await env.SHARE_KV.put(tokenKey, jsToken, { expirationTtl: 10 * 60 });
+      } catch {
+        // ignore cache write failures
+      }
+    }
+
+    try {
+      apiRes = await fetchApiWithToken(jsToken);
+    } catch (err) {
+      if (metrics) metrics.trackUpstreamError();
+      return errorJson(502, 'Upstream API request failed', 'upstream_error', err?.message || 'network_error');
+    }
+  }
 
   if (!apiRes.ok) {
     if (metrics) metrics.trackUpstreamError();
