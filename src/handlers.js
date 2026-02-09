@@ -2,7 +2,7 @@
  * Request handlers for different modes: page, api, resolve, stream, segment
  */
 
-import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream } from './utils.js';
+import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, errorJson } from './utils.js';
 import { rewriteM3U8 } from './m3u8.js';
 import { storeUpstreamData, getShareFromDb } from './db.js';
 
@@ -45,7 +45,7 @@ export async function handleApi(request, params) {
     })
   });
 
-  return jsonUpstream(res);
+  return jsonUpstream(res, 'Upstream API request failed');
 }
 
 /**
@@ -107,14 +107,18 @@ export async function handleResolve(request, params, env, metrics) {
     redirect: 'follow'
   });
 
+  if (!pageRes.ok) {
+    if (metrics) metrics.trackUpstreamError();
+    return errorJson(502, 'Upstream page request failed', 'upstream_error', {
+      status: pageRes.status
+    });
+  }
+
   const html = await pageRes.text();
   const jsToken = extractJsToken(html);
 
   if (!jsToken) {
-    return Response.json(
-      { error: 'Failed to extract jsToken' },
-      { status: 403 }
-    );
+    return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
   }
 
   const apiUrl = buildApiUrl(jsToken, surl, '1');
@@ -125,13 +129,25 @@ export async function handleResolve(request, params, env, metrics) {
     })
   });
 
-  const upstream = await apiRes.json();
+  if (!apiRes.ok) {
+    if (metrics) metrics.trackUpstreamError();
+    return errorJson(502, 'Upstream API request failed', 'upstream_error', {
+      status: apiRes.status
+    });
+  }
+
+  let upstream;
+  try {
+    upstream = await apiRes.json();
+  } catch {
+    if (metrics) metrics.trackUpstreamError();
+    return errorJson(502, 'Upstream returned non-JSON', 'upstream_non_json', {
+      status: apiRes.status
+    });
+  }
   if (!upstream?.list?.length) {
     if (metrics) metrics.trackUpstreamError();
-    return Response.json(
-      { error: 'Empty share list from upstream' },
-      { status: 502 }
-    );
+    return errorJson(502, 'Empty share list from upstream', 'upstream_empty');
   }
 
   // Store complete data in D1 for persistence (always, regardless of raw mode)
@@ -194,7 +210,7 @@ export async function handleStream(request, params, env, metrics) {
   const type = params.get('type') || 'M3U8_AUTO_360';
 
   if (!surl) {
-    return Response.json({ error: 'Missing surl' }, { status: 400 });
+    return badRequest('Missing surl', ['surl']);
   }
 
   const kvKey = `share:${surl}`;
@@ -213,37 +229,28 @@ export async function handleStream(request, params, env, metrics) {
 
   if (!record) {
     // Auto-resolve on cache miss to populate KV
-    const resolveRes = await handleResolve(request, params, env, metrics);
+    const resolveParams = new URLSearchParams(params);
+    resolveParams.delete('raw');
+    const resolveRes = await handleResolve(request, resolveParams, env, metrics);
     if (!resolveRes.ok) {
       return resolveRes;
     }
 
     try {
-      record = await env.SHARE_KV.get(kvKey, { type: 'json' });
-      if (metrics) metrics.trackKvOperation('read', true);
-      if (record) {
-        if (metrics) metrics.trackCache(true);
-      } else {
-        if (metrics) metrics.trackCache(false);
-      }
-    } catch (err) {
-      if (metrics) metrics.trackKvOperation('read', false);
+      const resolvedBody = await resolveRes.json();
+      record = resolvedBody?.data || null;
+    } catch {
+      record = null;
     }
 
     if (!record) {
-      return Response.json(
-        { error: 'Share not found in KV after resolve attempt.' },
-        { status: 404 }
-      );
+      return errorJson(404, 'Share not found after resolve attempt', 'not_found');
     }
   }
 
   const { uk, shareid, fid, dlink } = record;
   if (!uk || !shareid || !fid || !dlink) {
-    return Response.json(
-      { error: 'Incomplete stream metadata in KV' },
-      { status: 500 }
-    );
+    return errorJson(500, 'Incomplete stream metadata', 'incomplete_metadata');
   }
 
 
@@ -318,29 +325,52 @@ function isAllowedSegmentUrl(urlString) {
 export async function handleSegment(request, params) {
   const targetUrl = params.get('url');
   if (!targetUrl) {
-    return Response.json({ error: 'Missing url param' }, { status: 400 });
+    return badRequest('Missing url param', ['url']);
   }
 
   // SSRF protection: only allow TeraBox domains
   if (!isAllowedSegmentUrl(targetUrl)) {
-    return Response.json(
-      { error: 'Invalid segment URL: only TeraBox domains allowed' },
-      { status: 403 }
-    );
+    return errorJson(403, 'Invalid segment URL: only TeraBox domains allowed', 'invalid_segment_url');
   }
+
+  const forwardHeaders = {};
+  const range = request.headers.get('Range');
+  if (range) forwardHeaders.Range = range;
+  const ifRange = request.headers.get('If-Range');
+  if (ifRange) forwardHeaders['If-Range'] = ifRange;
+  const ifModified = request.headers.get('If-Modified-Since');
+  if (ifModified) forwardHeaders['If-Modified-Since'] = ifModified;
+  const ifNoneMatch = request.headers.get('If-None-Match');
+  if (ifNoneMatch) forwardHeaders['If-None-Match'] = ifNoneMatch;
+  const acceptEncoding = request.headers.get('Accept-Encoding');
+  if (acceptEncoding) forwardHeaders['Accept-Encoding'] = acceptEncoding;
 
   const res = await fetch(targetUrl, {
     headers: buildHeaders(request, {
-      Referer: 'https://www.terabox.com/'
+      Referer: 'https://www.terabox.com/',
+      ...forwardHeaders
     })
+  });
+
+  const responseHeaders = new Headers({
+    'Content-Type': res.headers.get('content-type') || 'video/mp2t',
+    'Cache-Control': 'no-store'
+  });
+  const passthroughHeaders = [
+    'Content-Range',
+    'Accept-Ranges',
+    'Content-Length',
+    'ETag',
+    'Last-Modified'
+  ];
+  passthroughHeaders.forEach((h) => {
+    const v = res.headers.get(h);
+    if (v) responseHeaders.set(h, v);
   });
 
   return new Response(res.body, {
     status: res.status,
-    headers: {
-      'Content-Type': res.headers.get('content-type') || 'video/mp2t',
-      'Cache-Control': 'no-store'
-    }
+    headers: responseHeaders
   });
 }
 
@@ -357,10 +387,7 @@ export async function handleLookup(request, params, env) {
   }
 
   if (!env.sharedfile) {
-    return Response.json(
-      { error: 'D1 database not configured' },
-      { status: 503 }
-    );
+    return errorJson(503, 'D1 database not configured', 'd1_unavailable');
   }
 
   try {
@@ -372,10 +399,7 @@ export async function handleLookup(request, params, env) {
         .first();
 
       if (!file) {
-        return Response.json(
-          { error: 'File not found', fid },
-          { status: 404 }
-        );
+        return errorJson(404, 'File not found', 'not_found', { fid });
       }
 
       // Get thumbnails for this file
@@ -400,10 +424,7 @@ export async function handleLookup(request, params, env) {
     const shareData = await getShareFromDb(env.sharedfile, surl);
 
     if (!shareData) {
-      return Response.json(
-        { error: 'Share not found in D1. Use mode=resolve first.', surl },
-        { status: 404 }
-      );
+      return errorJson(404, 'Share not found in D1. Use mode=resolve first.', 'not_found', { surl });
     }
 
     const hasDlink = shareData.list?.some(f => f.dlink) || false;
@@ -414,10 +435,7 @@ export async function handleLookup(request, params, env) {
     });
   } catch (err) {
     console.error('D1 lookup error:', err);
-    return Response.json(
-      { error: 'Database query failed', details: err.message },
-      { status: 500 }
-    );
+    return errorJson(500, 'Database query failed', 'db_error', err?.message || 'unknown');
   }
 }
 
@@ -441,20 +459,14 @@ function normalizeSort(sort, allowed, fallback) {
 
 function requireD1(env) {
   if (!env.sharedfile) {
-    return Response.json(
-      { error: 'D1 database not configured' },
-      { status: 503 }
-    );
+    return errorJson(503, 'D1 database not configured', 'd1_unavailable');
   }
   return null;
 }
 
 function requireKv(env) {
   if (!env.SHARE_KV) {
-    return Response.json(
-      { error: 'KV namespace not configured' },
-      { status: 503 }
-    );
+    return errorJson(503, 'KV namespace not configured', 'kv_unavailable');
   }
   return null;
 }
@@ -538,7 +550,7 @@ export async function handleAdminShareDetail(request, params, env, shareId) {
     .first();
 
   if (!share) {
-    return Response.json({ error: 'Share not found', share_id: shareId }, { status: 404 });
+    return errorJson(404, 'Share not found', 'not_found', { share_id: shareId });
   }
 
   const page = parsePositiveInt(params.get('page'), 1);
@@ -656,7 +668,7 @@ export async function handleAdminFileDetail(request, params, env, fsId) {
     .first();
 
   if (!file) {
-    return Response.json({ error: 'File not found', fs_id: fsId }, { status: 404 });
+    return errorJson(404, 'File not found', 'not_found', { fs_id: fsId });
   }
 
   const thumbs = await env.sharedfile
@@ -753,11 +765,11 @@ export async function handleAdminKvEntry(request, params, env) {
   try {
     const record = await env.SHARE_KV.get(`share:${surl}`, { type: 'json' });
     if (!record) {
-      return Response.json({ error: 'KV entry not found', surl }, { status: 404 });
+      return errorJson(404, 'KV entry not found', 'not_found', { surl });
     }
     return Response.json({ surl, data: record });
   } catch (err) {
-    return Response.json({ error: 'KV read failed', details: err.message }, { status: 500 });
+    return errorJson(500, 'KV read failed', 'kv_error', err?.message || 'unknown');
   }
 }
 
@@ -772,6 +784,6 @@ export async function handleAdminKvStats(request, params, env) {
       note: 'KV does not support listing all keys; stats are derived from stored metrics only.'
     });
   } catch (err) {
-    return Response.json({ error: 'KV read failed', details: err.message }, { status: 500 });
+    return errorJson(500, 'KV read failed', 'kv_error', err?.message || 'unknown');
   }
 }

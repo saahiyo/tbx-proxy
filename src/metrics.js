@@ -6,6 +6,7 @@
 export class MetricsCollector {
   constructor(env) {
     this.env = env;
+    this.kvEnabled = !!env?.SHARE_KV;
     this.metrics = {
       requests: {},
       errors: {},
@@ -25,6 +26,7 @@ export class MetricsCollector {
    * Load metrics from KV storage
    */
   async load() {
+    if (!this.kvEnabled) return;
     try {
       const stored = await this.env.SHARE_KV.get('metrics:current', { type: 'json' });
       if (stored) {
@@ -39,6 +41,7 @@ export class MetricsCollector {
    * Save metrics to KV storage
    */
   async save() {
+    if (!this.kvEnabled) return;
     try {
       await this.env.SHARE_KV.put('metrics:current', JSON.stringify(this.metrics));
     } catch (err) {
@@ -163,6 +166,7 @@ export class MetricsCollector {
     // Always save to KV first
     await this.save();
 
+    if (!this.kvEnabled) return;
     if (!this.env.METRICS_ENDPOINT) return;
 
     try {

@@ -16,7 +16,7 @@ import {
   handleAdminKvStats
 } from './handlers.js';
 import { MetricsCollector } from './metrics.js';
-import { CORS_HEADERS, withCors } from './utils.js';
+import { CORS_HEADERS, withCors, errorJson } from './utils.js';
 
 function isAdminAuthorized(url, request, env) {
   const key = url.searchParams.get('key') || request.headers.get('x-admin-key');
@@ -45,7 +45,7 @@ export default {
       // Admin routes (path-based)
       if (url.pathname.startsWith('/admin')) {
         if (!isAdminAuthorized(url, request, env)) {
-          return withCors(Response.json({ error: 'Unauthorized' }, { status: 401 }));
+          return withCors(errorJson(401, 'Unauthorized', 'unauthorized'));
         }
 
         const startTime = performance.now();
@@ -73,7 +73,7 @@ export default {
           } else if (url.pathname === '/admin/kv/stats') {
             response = await handleAdminKvStats(request, params, env);
           } else {
-            return withCors(Response.json({ error: 'Not found' }, { status: 404 }));
+            return withCors(errorJson(404, 'Not found', 'not_found'));
           }
 
           metricsInstance.trackRequest('admin');
@@ -85,10 +85,7 @@ export default {
         } catch (err) {
           metricsInstance.trackError('admin', err?.message || 'unknown');
           ctx.waitUntil(metricsInstance.flush());
-          return withCors(Response.json(
-            { error: err?.message || 'Internal error' },
-            { status: 500 }
-          ));
+          return withCors(errorJson(500, err?.message || 'Internal error', 'internal_error'));
         }
       }
 
@@ -118,6 +115,9 @@ export default {
       // Clear metrics endpoint (admin)
       if (mode === 'metrics-reset') {
         const key = params.get('key');
+        if (!env.SHARE_KV) {
+          return withCors(errorJson(503, 'KV namespace not configured', 'kv_unavailable'));
+        }
         if (key === env.ADMIN_KEY || !env.ADMIN_KEY) {
           await env.SHARE_KV.delete('metrics:current');
           metricsInstance.metrics = {
@@ -134,7 +134,7 @@ export default {
             { status: 200 }
           ));
         }
-        return withCors(Response.json({ error: 'Unauthorized' }, { status: 401 }));
+        return withCors(errorJson(401, 'Unauthorized', 'unauthorized'));
       }
 
       const startTime = performance.now();
@@ -152,6 +152,7 @@ export default {
           return withCors(Response.json(
             {
               error: 'Invalid or missing mode',
+              code: 'invalid_mode',
               allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'metrics', 'metrics-reset', 'admin/*']
             },
             { status: 400 }
@@ -173,10 +174,7 @@ export default {
         throw err;
       }
     } catch (err) {
-      return withCors(Response.json(
-        { error: err?.message || 'Internal error' },
-        { status: 500 }
-      ));
+      return withCors(errorJson(500, err?.message || 'Internal error', 'internal_error'));
     }
   }
 };

@@ -32,21 +32,37 @@ export function buildHeaders(request, extra = {}) {
   return headers;
 }
 
-export function badRequest(msg, required) {
-  return Response.json(
-    { error: msg, ...(required ? { required } : {}) },
-    { status: 400 }
-  );
+export function errorJson(status, message, code = 'error', details, required) {
+  const body = { error: message, code };
+  if (details !== undefined) body.details = details;
+  if (required) body.required = required;
+  return Response.json(body, { status });
 }
 
-export async function jsonUpstream(res) {
+export function badRequest(msg, required) {
+  return errorJson(400, msg, 'bad_request', undefined, required);
+}
+
+export async function jsonUpstream(res, message = 'Upstream request failed') {
   const ct = res.headers.get('content-type') || '';
-  return Response.json(
-    ct.includes('application/json')
-      ? await res.json()
-      : { error: 'Non-JSON response', status: res.status },
-    { status: res.status }
-  );
+
+  if (!res.ok) {
+    let details = { status: res.status };
+    if (ct.includes('application/json')) {
+      try {
+        details.body = await res.json();
+      } catch {
+        // ignore parse errors
+      }
+    }
+    return errorJson(502, message, 'upstream_error', details);
+  }
+
+  if (ct.includes('application/json')) {
+    return Response.json(await res.json(), { status: res.status });
+  }
+
+  return errorJson(502, 'Upstream returned non-JSON', 'upstream_non_json', { status: res.status });
 }
 
 /**
