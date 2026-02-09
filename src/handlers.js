@@ -19,11 +19,21 @@ function isTransientStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
-async function fetchWithRetry(url, options, retries = 2, baseDelayMs = 200) {
+async function fetchWithTimeout(url, options, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchWithRetry(url, options, retries = 2, baseDelayMs = 200, timeoutMs = 8000) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, options);
+      const res = await fetchWithTimeout(url, options, timeoutMs);
       if (res.ok || !isTransientStatus(res.status) || attempt === retries) {
         return res;
       }
@@ -49,10 +59,18 @@ export async function handlePage(request, params) {
   const url = new URL('https://www.terabox.app/sharing/link');
   url.searchParams.set('surl', surl);
 
-  const res = await fetch(url, {
-    headers: buildHeaders(request, { Accept: 'text/html' }),
-    redirect: 'follow'
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(url, {
+      headers: buildHeaders(request, { Accept: 'text/html' }),
+      redirect: 'follow'
+    }, 8000);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(504, 'Upstream page request timed out', 'upstream_timeout', {
+      reason: isAbort ? 'timeout' : 'network_error'
+    });
+  }
 
   return new Response(await res.text(), {
     status: res.status,
@@ -71,12 +89,20 @@ export async function handleApi(request, params) {
 
   const apiUrl = buildApiUrl(jsToken, shorturl, '1');
 
-  const res = await fetch(apiUrl, {
-    headers: buildHeaders(request, {
-      Accept: 'application/json',
-      Referer: 'https://terabox.com/'
-    })
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(apiUrl, {
+      headers: buildHeaders(request, {
+        Accept: 'application/json',
+        Referer: 'https://terabox.com/'
+      })
+    }, 8000);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(504, 'Upstream API request timed out', 'upstream_timeout', {
+      reason: isAbort ? 'timeout' : 'network_error'
+    });
+  }
 
   return jsonUpstream(res, 'Upstream API request failed');
 }
@@ -144,7 +170,7 @@ export async function handleResolve(request, params, env, metrics) {
 
   async function fetchApiWithToken(jsToken) {
     const apiUrl = buildApiUrl(jsToken, surl, '1');
-    return fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200);
+    return fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200, 8000);
   }
 
   let jsToken = null;
@@ -162,7 +188,13 @@ export async function handleResolve(request, params, env, metrics) {
       apiRes = await fetchApiWithToken(jsToken);
     } catch (err) {
       if (metrics) metrics.trackUpstreamError();
-      return errorJson(502, 'Upstream API request failed', 'upstream_error', err?.message || 'network_error');
+      const isAbort = err?.name === 'AbortError';
+      return errorJson(
+        isAbort ? 504 : 502,
+        isAbort ? 'Upstream API request timed out' : 'Upstream API request failed',
+        isAbort ? 'upstream_timeout' : 'upstream_error',
+        err?.message || (isAbort ? 'timeout' : 'network_error')
+      );
     }
     if (apiRes.status === 401 || apiRes.status === 403) {
       try {
@@ -184,10 +216,16 @@ export async function handleResolve(request, params, env, metrics) {
       pageRes = await fetchWithRetry(pageUrl.toString(), {
         headers: buildHeaders(request, { Accept: 'text/html' }),
         redirect: 'follow'
-      }, 2, 200);
+      }, 2, 200, 8000);
     } catch (err) {
       if (metrics) metrics.trackUpstreamError();
-      return errorJson(502, 'Upstream page request failed', 'upstream_error', err?.message || 'network_error');
+      const isAbort = err?.name === 'AbortError';
+      return errorJson(
+        isAbort ? 504 : 502,
+        isAbort ? 'Upstream page request timed out' : 'Upstream page request failed',
+        isAbort ? 'upstream_timeout' : 'upstream_error',
+        err?.message || (isAbort ? 'timeout' : 'network_error')
+      );
     }
 
     if (!pageRes.ok) {
@@ -216,7 +254,13 @@ export async function handleResolve(request, params, env, metrics) {
       apiRes = await fetchApiWithToken(jsToken);
     } catch (err) {
       if (metrics) metrics.trackUpstreamError();
-      return errorJson(502, 'Upstream API request failed', 'upstream_error', err?.message || 'network_error');
+      const isAbort = err?.name === 'AbortError';
+      return errorJson(
+        isAbort ? 504 : 502,
+        isAbort ? 'Upstream API request timed out' : 'Upstream API request failed',
+        isAbort ? 'upstream_timeout' : 'upstream_error',
+        err?.message || (isAbort ? 'timeout' : 'network_error')
+      );
     }
   }
 
@@ -359,12 +403,23 @@ streamUrl.searchParams.set('uk', uk);
   streamUrl.searchParams.set('timestamp', '1234567890'); // required timestamp
   streamUrl.searchParams.set('sign', 'abcd'); // required sign
 
-  const res = await fetch(streamUrl.toString(), {
-    headers: buildHeaders(request, {
-      Accept: '*/*',
-      Referer: 'https://www.terabox.com/'
-    })
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(streamUrl.toString(), {
+      headers: buildHeaders(request, {
+        Accept: '*/*',
+        Referer: 'https://www.terabox.com/'
+      })
+    }, 8000);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(
+      isAbort ? 504 : 502,
+      isAbort ? 'Upstream stream request timed out' : 'Upstream stream request failed',
+      isAbort ? 'upstream_timeout' : 'upstream_error',
+      err?.message || (isAbort ? 'timeout' : 'network_error')
+    );
+  }
 
   const playlist = await res.text();
   const rewritten = rewriteM3U8(playlist, request);
@@ -436,12 +491,23 @@ export async function handleSegment(request, params) {
   const acceptEncoding = request.headers.get('Accept-Encoding');
   if (acceptEncoding) forwardHeaders['Accept-Encoding'] = acceptEncoding;
 
-  const res = await fetch(targetUrl, {
-    headers: buildHeaders(request, {
-      Referer: 'https://www.terabox.com/',
-      ...forwardHeaders
-    })
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(targetUrl, {
+      headers: buildHeaders(request, {
+        Referer: 'https://www.terabox.com/',
+        ...forwardHeaders
+      })
+    }, 8000);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(
+      isAbort ? 504 : 502,
+      isAbort ? 'Upstream segment request timed out' : 'Upstream segment request failed',
+      isAbort ? 'upstream_timeout' : 'upstream_error',
+      err?.message || (isAbort ? 'timeout' : 'network_error')
+    );
+  }
 
   const responseHeaders = new Headers({
     'Content-Type': res.headers.get('content-type') || 'video/mp2t',
