@@ -7,6 +7,7 @@ yarn-error.log*
 lerna-debug.log*
 
 .wrangler
+wrangler.toml
 node_modules
 .DS_Store
 test_endpoints.py
