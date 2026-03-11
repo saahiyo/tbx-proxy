@@ -66,7 +66,7 @@ curl "https://tbx-proxy.shakir-ansarii075.workers.dev/?mode=stream&surl=YOUR_SHO
 
 ## Mode: `resolve` ⭐ Start Here
 
-Extracts file metadata and caches in KV (7 days) + D1 (permanent).
+Extracts file metadata and caches in D1.
 
 **Required:**
 - `surl` - TeraBox short URL (e.g., `abc123xyz`)
@@ -78,7 +78,7 @@ Extracts file metadata and caches in KV (7 days) + D1 (permanent).
 **Cache Behavior:**
 | Query | Cache Check | Speed |
 |-------|-------------|-------|
-| `?mode=resolve&surl=...` | KV → Upstream | ~500ms first, ~5ms cached |
+| `?mode=resolve&surl=...` | D1 → Upstream | ~500ms first, ~10ms cached |
 | `?mode=resolve&surl=...&raw=1` | D1 → Upstream | ~10ms cached |
 | `?mode=resolve&surl=...&refresh=1` | None → Upstream | ~1-2s always |
 
@@ -88,9 +88,9 @@ Extracts file metadata and caches in KV (7 days) + D1 (permanent).
 curl ".../?mode=resolve&surl=abc123"
 # Response: {"source": "live", "data": {...}}
 
-# Second time - returns from KV cache
+# Second time - returns from D1 cache
 curl ".../?mode=resolve&surl=abc123"
-# Response: {"source": "kv", "data": {...}}
+# Response: {"source": "d1", "data": {...}}
 
 # Get full data from D1 cache
 curl ".../?mode=resolve&surl=abc123&raw=1"
@@ -220,7 +220,6 @@ curl -o video.mp4 "$DLINK"
 | Source | Meaning |
 |--------|---------|
 | `"source": "live"` | Fresh data from TeraBox |
-| `"source": "kv"` | From Cloudflare KV cache (7-day TTL) |
 | `"source": "d1"` | From D1 database (permanent) |
 
 ---
@@ -259,6 +258,6 @@ curl -o video.mp4 "$DLINK"
 ## Need Help?
 
 - **Worker not deployed?** Run `npx wrangler deploy`
-- **KV/D1 not configured?** Check `wrangler.toml`
+- **D1 not configured?** Check `wrangler.toml`
 - **Getting 500 errors?** Try with `&raw=1` to see full response
 - **Link expired?** Use `&refresh=1` to re-fetch

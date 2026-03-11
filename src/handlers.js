@@ -6,15 +6,6 @@ import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, er
 import { rewriteM3U8 } from './m3u8.js';
 import { storeUpstreamData, getShareFromDb } from './db.js';
 
-function hashString(input) {
-  let hash = 5381;
-  for (let i = 0; i < input.length; i++) {
-    hash = ((hash << 5) + hash) + input.charCodeAt(i);
-    hash = hash & 0xffffffff;
-  }
-  return Math.abs(hash).toString(36);
-}
-
 function isTransientStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
@@ -47,6 +38,54 @@ async function fetchWithRetry(url, options, retries = 2, baseDelayMs = 200, time
     await new Promise(resolve => setTimeout(resolve, delay));
   }
   throw lastErr || new Error('Upstream request failed');
+}
+
+function toOptionalNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function buildResolvedRecord(surl, share, file, storedAt) {
+  if (!share || !file) return null;
+
+  return {
+    name: file.server_filename || null,
+    dlink: file.dlink || null,
+    size: toOptionalNumber(file.size),
+    time: toOptionalNumber(file.server_mtime),
+    original_url: `https://terabox.app/s/${surl}`,
+    thumb: file.thumbs?.url3 || file.thumbs?.url2 || file.thumbs?.url1 || null,
+    uk: share.uk || null,
+    shareid: share.shareid || share.share_id || null,
+    fid: file.fs_id || null,
+    stored_at: storedAt ?? null,
+    last_verified: storedAt ?? null
+  };
+}
+
+function buildResolvedRecordFromDb(surl, shareData) {
+  const file = shareData?.list?.[0];
+  const storedAt = shareData?.updated_at
+    ? Math.floor(new Date(shareData.updated_at).getTime() / 1000)
+    : null;
+
+  return buildResolvedRecord(surl, shareData, file, storedAt);
+}
+
+function buildResolvedRecordFromUpstream(surl, upstream) {
+  const file = upstream?.list?.[0];
+  const now = Math.floor(Date.now() / 1000);
+
+  return buildResolvedRecord(
+    surl,
+    {
+      uk: upstream?.uk,
+      shareid: upstream?.shareid || upstream?.share_id || null
+    },
+    file,
+    now
+  );
 }
 
 /**
@@ -108,7 +147,7 @@ export async function handleApi(request, params) {
 }
 
 /**
- * Handle resolve mode - extract metadata and cache in KV
+ * Handle resolve mode - extract metadata and cache in D1 when available
  */
 export async function handleResolve(request, params, env) {
   const surl = params.get('surl');
@@ -117,35 +156,22 @@ export async function handleResolve(request, params, env) {
 
   if (!surl) return badRequest('Missing surl');
 
-  const kvKey = `share:${surl}`;
-
-  // Check KV cache first (unless refresh or raw mode)
-  if (!refresh && !raw) {
-    try {
-      const stored = await env.SHARE_KV.get(kvKey, { type: 'json' });
-      if (stored) {
-        return Response.json({
-          source: 'kv',
-          ...(!stored.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-          data: stored
-        });
-      }
-    } catch (err) {
-      // Ignore KV cache read failures and fall back to upstream.
-    }
-  }
-
-  // For raw mode without refresh, check D1 cache first
-  if (raw && !refresh && env.sharedfile) {
+  if (!refresh && env.sharedfile) {
     try {
       const d1Data = await getShareFromDb(env.sharedfile, surl);
       if (d1Data) {
-        const hasDlink = d1Data.list?.some(f => f.dlink) || false;
-        return Response.json({
-          source: 'd1',
-          ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-          data: d1Data
-        });
+        const responseData = raw ? d1Data : buildResolvedRecordFromDb(surl, d1Data);
+        const hasDlink = raw
+          ? d1Data.list?.some(f => f.dlink) || false
+          : !!responseData?.dlink;
+
+        if (responseData) {
+          return Response.json({
+            source: 'd1',
+            ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
+            data: responseData
+          });
+        }
       }
     } catch (err) {
       console.error('D1 cache check error:', err);
@@ -153,11 +179,6 @@ export async function handleResolve(request, params, env) {
   }
 
   // Fetch fresh from upstream
-  const cookie = request.headers.get('Cookie') || '';
-  const tokenKey = env.SHARE_KV
-    ? `token:${surl}:${cookie ? hashString(cookie) : 'anon'}`
-    : null;
-
   const apiHeaders = buildHeaders(request, {
     Accept: 'application/json',
     Referer: 'https://terabox.com/'
@@ -168,91 +189,49 @@ export async function handleResolve(request, params, env) {
     return fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200, 8000);
   }
 
-  let jsToken = null;
-  if (tokenKey) {
-    try {
-      jsToken = await env.SHARE_KV.get(tokenKey);
-    } catch {
-      jsToken = null;
-    }
+  const pageUrl = new URL('https://www.terabox.app/sharing/link');
+  pageUrl.searchParams.set('surl', surl);
+
+  let pageRes;
+  try {
+    pageRes = await fetchWithRetry(pageUrl.toString(), {
+      headers: buildHeaders(request, { Accept: 'text/html' }),
+      redirect: 'follow'
+    }, 2, 200, 8000);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(
+      isAbort ? 504 : 502,
+      isAbort ? 'Upstream page request timed out' : 'Upstream page request failed',
+      isAbort ? 'upstream_timeout' : 'upstream_error',
+      err?.message || (isAbort ? 'timeout' : 'network_error')
+    );
+  }
+
+  if (!pageRes.ok) {
+    return errorJson(502, 'Upstream page request failed', 'upstream_error', {
+      status: pageRes.status
+    });
+  }
+
+  const html = await pageRes.text();
+  const jsToken = extractJsToken(html);
+
+  if (!jsToken) {
+    return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
   }
 
   let apiRes;
-  if (jsToken) {
-    try {
-      apiRes = await fetchApiWithToken(jsToken);
-    } catch (err) {
-      const isAbort = err?.name === 'AbortError';
-      return errorJson(
-        isAbort ? 504 : 502,
-        isAbort ? 'Upstream API request timed out' : 'Upstream API request failed',
-        isAbort ? 'upstream_timeout' : 'upstream_error',
-        err?.message || (isAbort ? 'timeout' : 'network_error')
-      );
-    }
-    if (apiRes.status === 401 || apiRes.status === 403) {
-      try {
-        await env.SHARE_KV.delete(tokenKey);
-      } catch {
-        // ignore
-      }
-      jsToken = null;
-      apiRes = null;
-    }
-  }
-
-  if (!apiRes) {
-    const pageUrl = new URL('https://www.terabox.app/sharing/link');
-    pageUrl.searchParams.set('surl', surl);
-
-    let pageRes;
-    try {
-      pageRes = await fetchWithRetry(pageUrl.toString(), {
-        headers: buildHeaders(request, { Accept: 'text/html' }),
-        redirect: 'follow'
-      }, 2, 200, 8000);
-    } catch (err) {
-      const isAbort = err?.name === 'AbortError';
-      return errorJson(
-        isAbort ? 504 : 502,
-        isAbort ? 'Upstream page request timed out' : 'Upstream page request failed',
-        isAbort ? 'upstream_timeout' : 'upstream_error',
-        err?.message || (isAbort ? 'timeout' : 'network_error')
-      );
-    }
-
-    if (!pageRes.ok) {
-      return errorJson(502, 'Upstream page request failed', 'upstream_error', {
-        status: pageRes.status
-      });
-    }
-
-    const html = await pageRes.text();
-    jsToken = extractJsToken(html);
-
-    if (!jsToken) {
-      return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
-    }
-
-    if (tokenKey) {
-      try {
-        await env.SHARE_KV.put(tokenKey, jsToken, { expirationTtl: 10 * 60 });
-      } catch {
-        // ignore cache write failures
-      }
-    }
-
-    try {
-      apiRes = await fetchApiWithToken(jsToken);
-    } catch (err) {
-      const isAbort = err?.name === 'AbortError';
-      return errorJson(
-        isAbort ? 504 : 502,
-        isAbort ? 'Upstream API request timed out' : 'Upstream API request failed',
-        isAbort ? 'upstream_timeout' : 'upstream_error',
-        err?.message || (isAbort ? 'timeout' : 'network_error')
-      );
-    }
+  try {
+    apiRes = await fetchApiWithToken(jsToken);
+  } catch (err) {
+    const isAbort = err?.name === 'AbortError';
+    return errorJson(
+      isAbort ? 504 : 502,
+      isAbort ? 'Upstream API request timed out' : 'Upstream API request failed',
+      isAbort ? 'upstream_timeout' : 'upstream_error',
+      err?.message || (isAbort ? 'timeout' : 'network_error')
+    );
   }
 
   if (!apiRes.ok) {
@@ -273,7 +252,7 @@ export async function handleResolve(request, params, env) {
     return errorJson(502, 'Empty share list from upstream', 'upstream_empty');
   }
 
-  // Store complete data in D1 for persistence (always, regardless of raw mode)
+  // Store complete data in D1 for persistence when configured.
   try {
     if (env.sharedfile) {
       await storeUpstreamData(env.sharedfile, surl, upstream);
@@ -291,41 +270,20 @@ export async function handleResolve(request, params, env) {
     });
   }
 
-  const file = upstream.list[0];
-  const now = Math.floor(Date.now() / 1000);
-
-  const record = {
-    name: file.server_filename,
-    dlink: file.dlink,
-    size: Number(file.size),
-    time: Number(file.server_mtime),
-    original_url: `https://terabox.app/s/${surl}`,
-    thumb: file.thumbs?.url3 || file.thumbs?.url2 || file.thumbs?.url1 || null,
-    uk: upstream.uk,
-    shareid: upstream.shareid || upstream.share_id,
-    fid: file.fs_id,
-    stored_at: now,
-    last_verified: now
-  };
-
-  try {
-    // KV put with TTL (7 days)
-    await env.SHARE_KV.put(kvKey, JSON.stringify(record), {
-      expirationTtl: 7 * 24 * 60 * 60
-    });
-  } catch (err) {
-    // Ignore KV cache write failures after a successful upstream response.
-  }
-
+  const record = buildResolvedRecordFromUpstream(surl, upstream);
   return Response.json({
     source: 'live',
-    ...(!record.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
+    ...(!record?.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
     data: record
   });
 }
 
+function hasStreamMetadata(record) {
+  return !!(record?.uk && record?.shareid && record?.fid && record?.dlink);
+}
+
 /**
- * Handle stream mode - returns M3U8 playlist using stored metadata
+ * Handle stream mode - returns M3U8 playlist using cached metadata
  */
 export async function handleStream(request, params, env) {
   const surl = params.get('surl');
@@ -335,18 +293,23 @@ export async function handleStream(request, params, env) {
     return badRequest('Missing surl', ['surl']);
   }
 
-  const kvKey = `share:${surl}`;
-  let record;
-  try {
-    record = await env.SHARE_KV.get(kvKey, { type: 'json' });
-  } catch (err) {
-    // Ignore KV cache read failures and fall back to resolve.
+  let record = null;
+  if (env.sharedfile) {
+    try {
+      const cachedShare = await getShareFromDb(env.sharedfile, surl);
+      if (cachedShare) {
+        record = buildResolvedRecordFromDb(surl, cachedShare);
+      }
+    } catch (err) {
+      console.error('D1 stream cache check error:', err);
+    }
   }
 
-  if (!record) {
-    // Auto-resolve on cache miss to populate KV
+  if (!hasStreamMetadata(record)) {
     const resolveParams = new URLSearchParams(params);
     resolveParams.delete('raw');
+    resolveParams.set('refresh', '1');
+
     const resolveRes = await handleResolve(request, resolveParams, env);
     if (!resolveRes.ok) {
       return resolveRes;
@@ -359,8 +322,8 @@ export async function handleStream(request, params, env) {
       record = null;
     }
 
-    if (!record) {
-      return errorJson(404, 'Share not found after resolve attempt', 'not_found');
+    if (!hasStreamMetadata(record)) {
+      return errorJson(500, 'Incomplete stream metadata', 'incomplete_metadata');
     }
   }
 
@@ -370,10 +333,10 @@ export async function handleStream(request, params, env) {
   }
 
 
-/* Build streaming URL using signed dlink params */
-const streamUrl = new URL('https://dm.1024tera.com/share/streaming');
+  /* Build streaming URL using signed dlink params */
+  const streamUrl = new URL('https://dm.1024tera.com/share/streaming');
 
-streamUrl.searchParams.set('uk', uk);
+  streamUrl.searchParams.set('uk', uk);
   streamUrl.searchParams.set('shareid', shareid);
   streamUrl.searchParams.set('fid', fid);
   streamUrl.searchParams.set('type', type);
@@ -598,13 +561,6 @@ function normalizeSort(sort, allowed, fallback) {
 function requireD1(env) {
   if (!env.sharedfile) {
     return errorJson(503, 'D1 database not configured', 'd1_unavailable');
-  }
-  return null;
-}
-
-function requireKv(env) {
-  if (!env.SHARE_KV) {
-    return errorJson(503, 'KV namespace not configured', 'kv_unavailable');
   }
   return null;
 }
@@ -894,19 +850,20 @@ export async function handleAdminAnalyticsProcessed(request, params, env) {
 }
 
 export async function handleAdminKvEntry(request, params, env) {
-  const missing = requireKv(env);
+  const missing = requireD1(env);
   if (missing) return missing;
 
   const surl = params.get('surl');
   if (!surl) return badRequest('Missing surl');
 
   try {
-    const record = await env.SHARE_KV.get(`share:${surl}`, { type: 'json' });
+    const shareData = await getShareFromDb(env.sharedfile, surl);
+    const record = buildResolvedRecordFromDb(surl, shareData);
     if (!record) {
-      return errorJson(404, 'KV entry not found', 'not_found', { surl });
+      return errorJson(404, 'Cached entry not found', 'not_found', { surl });
     }
     return Response.json({ surl, data: record });
   } catch (err) {
-    return errorJson(500, 'KV read failed', 'kv_error', err?.message || 'unknown');
+    return errorJson(500, 'Cached entry lookup failed', 'db_error', err?.message || 'unknown');
   }
 }

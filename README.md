@@ -1,12 +1,12 @@
 # tbx-proxy
 
-A Cloudflare Workers proxy for TeraBox file sharing. This service provides multiple access modes to fetch, stream, and resolve TeraBox shares with metadata caching via Cloudflare KV and D1 database.
+A Cloudflare Workers proxy for TeraBox file sharing. This service provides multiple access modes to fetch, stream, and resolve TeraBox shares with metadata caching via a D1 database.
 
 ## Features
 
 - **Page Mode**: Fetch TeraBox share pages
 - **API Mode**: Direct API calls with token-based authentication
-- **Resolve Mode**: Extract file metadata and cache in KV + D1
+- **Resolve Mode**: Extract file metadata and cache in D1
 - **Stream Mode**: Get M3U8 playlists for video streaming
 - **Segment Mode**: Proxy video segments (with SSRF protection)
 - **Lookup Mode**: Query cached D1 data without hitting upstream
@@ -32,7 +32,7 @@ Main Cloudflare Worker handler that routes requests based on the `mode` query pa
 Contains six handler functions:
 - `handlePage()` - Fetches share pages from TeraBox
 - `handleApi()` - Makes manual API calls with jsToken
-- `handleResolve()` - Extracts metadata and stores in KV + D1
+- `handleResolve()` - Extracts metadata and stores in D1
 - `handleStream()` - Returns M3U8 playlists from cached metadata
 - `handleSegment()` - Proxies video segments (SSRF protected)
 - `handleLookup()` - Queries D1 database directly
@@ -90,7 +90,7 @@ GET /?mode=api&jsToken=<token>&shorturl=<shorturl>
 ---
 
 #### Mode: `resolve`
-Extracts file metadata from a share and caches it in KV and D1.
+Extracts file metadata from a share and caches it in D1.
 
 ```
 GET /?mode=resolve&surl=<shorturl>[&refresh=1][&raw=1]
@@ -104,14 +104,14 @@ GET /?mode=resolve&surl=<shorturl>[&refresh=1][&raw=1]
 **Cache Behavior:**
 | Query | Cache Check Order |
 |-------|-------------------|
-| `mode=resolve&surl=...` | KV → Upstream → Store in KV + D1 |
+| `mode=resolve&surl=...` | D1 → Upstream → Store in D1 |
 | `mode=resolve&surl=...&raw=1` | D1 → Upstream → Store in D1 |
 | `mode=resolve&surl=...&refresh=1` | Upstream → Store |
 
 **Response:**
 ```json
 {
-  "source": "live|kv|d1",
+  "source": "live|d1",
   "data": {
     "name": "filename",
     "dlink": "signed_download_link",
@@ -203,7 +203,7 @@ GET /?mode=health
 
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/) installed
 - Cloudflare account with Workers enabled
-- KV namespace and D1 database created
+- D1 database created
 
 ### Configuration
 
@@ -213,10 +213,6 @@ Update `wrangler.toml`:
 name = "tbx-proxy"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
-
-kv_namespaces = [
-  { binding = "SHARE_KV", id = "YOUR_KV_NAMESPACE_ID" }
-]
 
 [[d1_databases]]
 binding = "sharedfile"
