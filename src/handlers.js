@@ -282,6 +282,25 @@ function hasStreamMetadata(record) {
   return !!(record?.uk && record?.shareid && record?.fid && record?.dlink);
 }
 
+function getStreamAuthFromDlink(dlink) {
+  if (!dlink) return null;
+
+  try {
+    const url = new URL(dlink);
+    const sign = url.searchParams.get('sign');
+    const timestamp = url.searchParams.get('dstime') || url.searchParams.get('timestamp');
+    const logid = url.searchParams.get('dp-logid');
+
+    if (!sign || !timestamp) {
+      return null;
+    }
+
+    return { sign, timestamp, logid };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Handle stream mode - returns M3U8 playlist using cached metadata
  */
@@ -332,6 +351,14 @@ export async function handleStream(request, params, env) {
     return errorJson(500, 'Incomplete stream metadata', 'incomplete_metadata');
   }
 
+  const streamAuth = getStreamAuthFromDlink(dlink);
+  if (!streamAuth) {
+    return errorJson(
+      502,
+      'Missing signed stream parameters in dlink',
+      'stream_auth_missing'
+    );
+  }
 
   /* Build streaming URL using signed dlink params */
   const streamUrl = new URL('https://dm.1024tera.com/share/streaming');
@@ -344,8 +371,11 @@ export async function handleStream(request, params, env) {
   streamUrl.searchParams.set('app_id', '250528');
   streamUrl.searchParams.set('web', '1');
   streamUrl.searchParams.set('channel', 'dubox');
-  streamUrl.searchParams.set('timestamp', '1234567890'); // required timestamp
-  streamUrl.searchParams.set('sign', 'abcd'); // required sign
+  streamUrl.searchParams.set('timestamp', streamAuth.timestamp);
+  streamUrl.searchParams.set('sign', streamAuth.sign);
+  if (streamAuth.logid) {
+    streamUrl.searchParams.set('dp-logid', streamAuth.logid);
+  }
 
   let res;
   try {
@@ -365,7 +395,19 @@ export async function handleStream(request, params, env) {
     );
   }
 
+  if (!res.ok) {
+    return errorJson(502, 'Upstream stream request failed', 'upstream_error', {
+      status: res.status
+    });
+  }
+
   const playlist = await res.text();
+  if (!playlist.includes('#EXTM3U')) {
+    return errorJson(502, 'Upstream stream returned non-M3U8 content', 'upstream_non_m3u8', {
+      status: res.status,
+      preview: playlist.slice(0, 300)
+    });
+  }
   const rewritten = rewriteM3U8(playlist, request);
 
   return new Response(rewritten, {
@@ -392,7 +434,10 @@ const ALLOWED_SEGMENT_DOMAINS = [
   'terasharelink.com',
   'terafileshare.com',
   'teraboxlink.com',
-  'teraboxshare.com'
+  'teraboxshare.com',
+  'terasharefile.com',
+  'teraboxurl.com',
+  
 ];
 
 /**
