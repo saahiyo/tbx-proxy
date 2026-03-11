@@ -110,7 +110,7 @@ export async function handleApi(request, params) {
 /**
  * Handle resolve mode - extract metadata and cache in KV
  */
-export async function handleResolve(request, params, env, metrics) {
+export async function handleResolve(request, params, env) {
   const surl = params.get('surl');
   const refresh = params.get('refresh') === '1';
   const raw = params.get('raw') === '1';
@@ -123,18 +123,15 @@ export async function handleResolve(request, params, env, metrics) {
   if (!refresh && !raw) {
     try {
       const stored = await env.SHARE_KV.get(kvKey, { type: 'json' });
-      if (metrics) metrics.trackKvOperation('read', true);
       if (stored) {
-        if (metrics) metrics.trackCache(true);
         return Response.json({
           source: 'kv',
           ...(!stored.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
           data: stored
         });
       }
-      if (metrics) metrics.trackCache(false);
     } catch (err) {
-      if (metrics) metrics.trackKvOperation('read', false);
+      // Ignore KV cache read failures and fall back to upstream.
     }
   }
 
@@ -143,7 +140,6 @@ export async function handleResolve(request, params, env, metrics) {
     try {
       const d1Data = await getShareFromDb(env.sharedfile, surl);
       if (d1Data) {
-        if (metrics) metrics.trackCache(true);
         const hasDlink = d1Data.list?.some(f => f.dlink) || false;
         return Response.json({
           source: 'd1',
@@ -151,7 +147,6 @@ export async function handleResolve(request, params, env, metrics) {
           data: d1Data
         });
       }
-      if (metrics) metrics.trackCache(false);
     } catch (err) {
       console.error('D1 cache check error:', err);
     }
@@ -187,7 +182,6 @@ export async function handleResolve(request, params, env, metrics) {
     try {
       apiRes = await fetchApiWithToken(jsToken);
     } catch (err) {
-      if (metrics) metrics.trackUpstreamError();
       const isAbort = err?.name === 'AbortError';
       return errorJson(
         isAbort ? 504 : 502,
@@ -218,7 +212,6 @@ export async function handleResolve(request, params, env, metrics) {
         redirect: 'follow'
       }, 2, 200, 8000);
     } catch (err) {
-      if (metrics) metrics.trackUpstreamError();
       const isAbort = err?.name === 'AbortError';
       return errorJson(
         isAbort ? 504 : 502,
@@ -229,7 +222,6 @@ export async function handleResolve(request, params, env, metrics) {
     }
 
     if (!pageRes.ok) {
-      if (metrics) metrics.trackUpstreamError();
       return errorJson(502, 'Upstream page request failed', 'upstream_error', {
         status: pageRes.status
       });
@@ -253,7 +245,6 @@ export async function handleResolve(request, params, env, metrics) {
     try {
       apiRes = await fetchApiWithToken(jsToken);
     } catch (err) {
-      if (metrics) metrics.trackUpstreamError();
       const isAbort = err?.name === 'AbortError';
       return errorJson(
         isAbort ? 504 : 502,
@@ -265,7 +256,6 @@ export async function handleResolve(request, params, env, metrics) {
   }
 
   if (!apiRes.ok) {
-    if (metrics) metrics.trackUpstreamError();
     return errorJson(502, 'Upstream API request failed', 'upstream_error', {
       status: apiRes.status
     });
@@ -275,13 +265,11 @@ export async function handleResolve(request, params, env, metrics) {
   try {
     upstream = await apiRes.json();
   } catch {
-    if (metrics) metrics.trackUpstreamError();
     return errorJson(502, 'Upstream returned non-JSON', 'upstream_non_json', {
       status: apiRes.status
     });
   }
   if (!upstream?.list?.length) {
-    if (metrics) metrics.trackUpstreamError();
     return errorJson(502, 'Empty share list from upstream', 'upstream_empty');
   }
 
@@ -325,9 +313,8 @@ export async function handleResolve(request, params, env, metrics) {
     await env.SHARE_KV.put(kvKey, JSON.stringify(record), {
       expirationTtl: 7 * 24 * 60 * 60
     });
-    if (metrics) metrics.trackKvOperation('write', true);
   } catch (err) {
-    if (metrics) metrics.trackKvOperation('write', false);
+    // Ignore KV cache write failures after a successful upstream response.
   }
 
   return Response.json({
@@ -340,7 +327,7 @@ export async function handleResolve(request, params, env, metrics) {
 /**
  * Handle stream mode - returns M3U8 playlist using stored metadata
  */
-export async function handleStream(request, params, env, metrics) {
+export async function handleStream(request, params, env) {
   const surl = params.get('surl');
   const type = params.get('type') || 'M3U8_AUTO_360';
 
@@ -352,21 +339,15 @@ export async function handleStream(request, params, env, metrics) {
   let record;
   try {
     record = await env.SHARE_KV.get(kvKey, { type: 'json' });
-    if (metrics) metrics.trackKvOperation('read', true);
-    if (record) {
-      if (metrics) metrics.trackCache(true);
-    } else {
-      if (metrics) metrics.trackCache(false);
-    }
   } catch (err) {
-    if (metrics) metrics.trackKvOperation('read', false);
+    // Ignore KV cache read failures and fall back to resolve.
   }
 
   if (!record) {
     // Auto-resolve on cache miss to populate KV
     const resolveParams = new URLSearchParams(params);
     resolveParams.delete('raw');
-    const resolveRes = await handleResolve(request, resolveParams, env, metrics);
+    const resolveRes = await handleResolve(request, resolveParams, env);
     if (!resolveRes.ok) {
       return resolveRes;
     }
@@ -925,21 +906,6 @@ export async function handleAdminKvEntry(request, params, env) {
       return errorJson(404, 'KV entry not found', 'not_found', { surl });
     }
     return Response.json({ surl, data: record });
-  } catch (err) {
-    return errorJson(500, 'KV read failed', 'kv_error', err?.message || 'unknown');
-  }
-}
-
-export async function handleAdminKvStats(request, params, env) {
-  const missing = requireKv(env);
-  if (missing) return missing;
-
-  try {
-    const metrics = await env.SHARE_KV.get('metrics:current', { type: 'json' });
-    return Response.json({
-      metrics: metrics || null,
-      note: 'KV does not support listing all keys; stats are derived from stored metrics only.'
-    });
   } catch (err) {
     return errorJson(500, 'KV read failed', 'kv_error', err?.message || 'unknown');
   }

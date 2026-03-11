@@ -11,7 +11,6 @@ A Cloudflare Workers proxy for TeraBox file sharing. This service provides multi
 - **Segment Mode**: Proxy video segments (with SSRF protection)
 - **Lookup Mode**: Query cached D1 data without hitting upstream
 - **CORS Support**: Full cross-origin request support
-- **Metrics**: Built-in request tracking and performance metrics
 
 ## Project Structure
 
@@ -22,13 +21,12 @@ src/
 ├── utils.js       # Utility functions (headers, CORS, validation)
 ├── db.js          # D1 database operations (batched)
 ├── m3u8.js        # M3U8 playlist processing
-└── metrics.js     # Metrics collection and tracking
 ```
 
 ### Module Overview
 
 #### `index.js`
-Main Cloudflare Worker handler that routes requests based on the `mode` query parameter. Includes CORS preflight handling and non-blocking metrics via `waitUntil()`.
+Main Cloudflare Worker handler that routes requests based on the `mode` query parameter and handles CORS preflight requests.
 
 #### `handlers.js`
 Contains six handler functions:
@@ -191,19 +189,10 @@ GET /?mode=segment&url=<segment_url>
 ---
 
 #### Mode: `health`
-Returns service health status and metrics summary.
+Returns service health status.
 
 ```
 GET /?mode=health
-```
-
----
-
-#### Mode: `metrics`
-Returns detailed metrics about requests, cache hits, and response times.
-
-```
-GET /?mode=metrics
 ```
 
 ---

@@ -61,7 +61,6 @@ curl "https://tbx-proxy.shakir-ansarii075.workers.dev/?mode=stream&surl=YOUR_SHO
 | `api` | Direct API call | `jsToken`, `shorturl` |
 | `segment` | Proxy video segments | `url` |
 | `health` | Service health check | none |
-| `metrics` | View usage metrics | none |
 
 ---
 
@@ -170,26 +169,11 @@ Proxies video segments. Called automatically by M3U8 playlist.
 
 ---
 
-## Mode: `health` & `metrics`
+## Mode: `health`
 
 ```bash
 # Health check
 curl ".../?mode=health"
-
-# Usage metrics
-curl ".../?mode=metrics"
-```
-
-**Metrics Response:**
-```json
-{
-  "totalRequests": 1234,
-  "requestsByMode": {"resolve": 500, "stream": 400, ...},
-  "cacheHits": 800,
-  "cacheMisses": 200,
-  "cacheHitRate": "80.00%",
-  "responseTimes": {"resolve": {"average": 450, "min": 5, "max": 2000}}
-}
 ```
 
 ---
