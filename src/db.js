@@ -234,21 +234,31 @@ export async function getShareFromDb(db, shareId) {
     .bind(shareId)
     .all();
 
-  // Get thumbnails for each file
-  const filesWithThumbs = await Promise.all(
-    files.results.map(async (file) => {
-      const thumbs = await db.prepare('SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?')
-        .bind(file.fs_id)
-        .all();
-      
-      const thumbsObj = {};
-      thumbs.results.forEach(t => {
-        thumbsObj[t.thumbnail_type] = t.url;
-      });
+  const fileRows = files.results || [];
+  const fileIds = fileRows.map(file => file.fs_id).filter(Boolean);
+  let thumbsByFsId = {};
 
-      return { ...file, thumbs: thumbsObj };
-    })
-  );
+  if (fileIds.length > 0) {
+    const placeholders = fileIds.map(() => '?').join(',');
+    const thumbs = await db.prepare(
+      `SELECT fs_id, url, thumbnail_type FROM thumbnails WHERE fs_id IN (${placeholders})`
+    )
+      .bind(...fileIds)
+      .all();
+
+    thumbsByFsId = {};
+    (thumbs.results || []).forEach((thumb) => {
+      if (!thumbsByFsId[thumb.fs_id]) {
+        thumbsByFsId[thumb.fs_id] = {};
+      }
+      thumbsByFsId[thumb.fs_id][thumb.thumbnail_type] = thumb.url;
+    });
+  }
+
+  const filesWithThumbs = fileRows.map((file) => ({
+    ...file,
+    thumbs: thumbsByFsId[file.fs_id] || {}
+  }));
 
   return {
     ...share,
