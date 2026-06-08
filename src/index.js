@@ -12,7 +12,8 @@ import {
   handleAdminFileDetail,
   handleAdminThumbnails,
   handleAdminAnalyticsProcessed,
-  handleAdminKvEntry
+  handleAdminKvEntry,
+  handleThumbnail
 } from './handlers.js';
 import { CORS_HEADERS, withCors, errorJson } from './utils.js';
 
@@ -92,12 +93,13 @@ export default {
         else if (mode === 'stream') response = await handleStream(request, params, env);
         else if (mode === 'segment') response = await handleSegment(request, params);
         else if (mode === 'lookup') response = await handleLookup(request, params, env);
+        else if (mode === 'thumbnail') response = await handleThumbnail(request, params, env);
         else {
           return withCors(Response.json(
             {
               error: 'Invalid or missing mode',
               code: 'invalid_mode',
-              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'health', 'admin/*']
+              allowed: ['page', 'api', 'resolve', 'stream', 'segment', 'lookup', 'thumbnail', 'health', 'admin/*']
             },
             { status: 400 }
           ));

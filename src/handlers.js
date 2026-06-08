@@ -1047,3 +1047,124 @@ export async function handleAdminKvEntry(request, params, env) {
     return errorJson(500, 'Cached entry lookup failed', 'db_error', err?.message || 'unknown');
   }
 }
+
+export async function handleThumbnail(request, params, env) {
+  const fid = params.get('fid');
+  const size = params.get('size') || 'url3'; // url3 is typically the highest resolution (850x580)
+  let surl = normalizeSurl(params.get('surl'));
+
+  if (!fid) {
+    return badRequest('Missing fid parameter', ['fid']);
+  }
+  if (!/^\d+$/.test(fid)) {
+    return badRequest('Invalid fid format');
+  }
+
+  if (!env.sharedfile) {
+    return errorJson(503, 'D1 database not configured', 'd1_unavailable');
+  }
+
+  // 1. Try to find the share_id (surl) from the database if not provided
+  if (!surl) {
+    try {
+      const row = await env.sharedfile
+        .prepare('SELECT share_id FROM media_files WHERE fs_id = ?')
+        .bind(fid)
+        .first();
+      if (row) {
+        surl = row.share_id;
+      }
+    } catch (err) {
+      console.error('Database query error looking up share_id:', err);
+    }
+  }
+
+  // 2. Helper function to fetch the image from a signed URL and return it
+  const fetchAndServeImage = async (imgUrl) => {
+    const res = await fetchWithTimeout(imgUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.terabox.com/'
+      }
+    }, 6000);
+
+    if (res.ok) {
+      const contentType = res.headers.get('content-type') || 'image/jpeg';
+      // Return the image data with caching headers to cache on CDN
+      return new Response(res.body, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Cache-Control': 'public, max-age=31536000', // 1 year cache
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+    return null;
+  };
+
+  // 3. Try fetching using the cached thumbnail URL in D1 first
+  let cachedThumb = null;
+  try {
+    cachedThumb = await env.sharedfile
+      .prepare('SELECT url FROM thumbnails WHERE fs_id = ? AND thumbnail_type = ?')
+      .bind(fid, size)
+      .first();
+  } catch (err) {
+    console.error('Database query error looking up thumbnail:', err);
+  }
+
+  if (cachedThumb?.url) {
+    try {
+      const response = await fetchAndServeImage(cachedThumb.url);
+      if (response) {
+        return response;
+      }
+      console.log(`[handleThumbnail] Cached thumbnail URL for fid ${fid} expired or invalid. Re-resolving share.`);
+    } catch (err) {
+      console.error('Error fetching cached thumbnail image:', err);
+    }
+  }
+
+  // 4. If not found or expired, we need to resolve from upstream to refresh the signed URLs
+  if (!surl) {
+    return errorJson(404, 'Thumbnail not cached and associated surl not found. Please resolve the share first.', 'not_found');
+  }
+
+  // Trigger handleResolve to refresh the cache in D1
+  console.log(`[handleThumbnail] Triggering live resolve for surl ${surl} to refresh thumbnails.`);
+  const resolveParams = new URLSearchParams();
+  resolveParams.set('surl', surl);
+  resolveParams.set('refresh', '1');
+  resolveParams.set('raw', '1');
+
+  const resolveRes = await handleResolve(request, resolveParams, env);
+  if (!resolveRes.ok) {
+    return resolveRes; // Return the resolve error (e.g. share deleted / verify needed)
+  }
+
+  // 5. Query D1 again for the newly resolved signed URL
+  let freshThumb = null;
+  try {
+    freshThumb = await env.sharedfile
+      .prepare('SELECT url FROM thumbnails WHERE fs_id = ? AND thumbnail_type = ?')
+      .bind(fid, size)
+      .first();
+  } catch (err) {
+    console.error('Database query error looking up fresh thumbnail:', err);
+  }
+
+  if (freshThumb?.url) {
+    try {
+      const response = await fetchAndServeImage(freshThumb.url);
+      if (response) {
+        return response;
+      }
+    } catch (err) {
+      console.error('Error fetching fresh thumbnail image:', err);
+    }
+  }
+
+  return errorJson(502, 'Failed to fetch thumbnail image from upstream', 'upstream_image_error');
+}
+
