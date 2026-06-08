@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS shares (
   share_id TEXT PRIMARY KEY,
   uk TEXT,
+  shareid TEXT,
   title TEXT,
   server_time INTEGER,
   cfrom_id TEXT,
@@ -8,6 +9,7 @@ CREATE TABLE IF NOT EXISTS shares (
   request_id TEXT,
   updated_at DATETIME
 );
+
 
 CREATE TABLE IF NOT EXISTS media_files (
   fs_id TEXT PRIMARY KEY,

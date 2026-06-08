@@ -10,10 +10,11 @@
  */
 export async function saveShare(db, shareId, data) {
   const stmt = db.prepare(`
-    INSERT INTO shares (share_id, uk, title, server_time, cfrom_id, errno, request_id, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    INSERT INTO shares (share_id, uk, shareid, title, server_time, cfrom_id, errno, request_id, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ON CONFLICT(share_id) DO UPDATE SET
       uk = excluded.uk,
+      shareid = excluded.shareid,
       title = excluded.title,
       server_time = excluded.server_time,
       cfrom_id = excluded.cfrom_id,
@@ -25,6 +26,7 @@ export async function saveShare(db, shareId, data) {
   await stmt.bind(
     shareId,
     data.uk?.toString() || null,
+    data.shareid?.toString() || data.share_id?.toString() || null,
     data.title || null,
     data.server_time || null,
     data.cfrom_id || null,
@@ -125,10 +127,11 @@ export async function storeUpstreamData(db, shareId, upstream) {
     // Add share metadata statement
     batch.push(
       db.prepare(`
-        INSERT INTO shares (share_id, uk, title, server_time, cfrom_id, errno, request_id, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO shares (share_id, uk, shareid, title, server_time, cfrom_id, errno, request_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(share_id) DO UPDATE SET
           uk = excluded.uk,
+          shareid = excluded.shareid,
           title = excluded.title,
           server_time = excluded.server_time,
           cfrom_id = excluded.cfrom_id,
@@ -138,6 +141,7 @@ export async function storeUpstreamData(db, shareId, upstream) {
       `).bind(
         shareId,
         upstream.uk?.toString() || null,
+        upstream.shareid?.toString() || upstream.share_id?.toString() || null,
         upstream.title || null,
         upstream.server_time || null,
         upstream.cfrom_id || null,

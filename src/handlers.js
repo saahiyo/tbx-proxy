@@ -96,34 +96,93 @@ function toOptionalNumber(value) {
   return Number.isFinite(num) ? num : null;
 }
 
-function buildResolvedRecord(surl, share, file, storedAt) {
+function getProxyThumbnailUrl(origin, fid, size, surl) {
+  const params = new URLSearchParams();
+  params.set('mode', 'thumbnail');
+  params.set('fid', fid);
+  if (size && size !== 'url3') {
+    params.set('size', size);
+  }
+  if (surl) {
+    params.set('surl', surl);
+  }
+  return `${origin}/?${params.toString()}`;
+}
+
+function rewriteResponseThumbnails(obj, requestUrl, surl) {
+  if (!obj || typeof obj !== 'object') return obj;
+  
+  const origin = new URL(requestUrl).origin;
+  
+  const processFile = (file, fileSurl) => {
+    const fid = file.fs_id || file.fid;
+    if (!fid) return;
+    
+    const resolvedSurl = fileSurl || file.share_id || surl;
+    
+    if (file.thumb && typeof file.thumb === 'string' && !file.thumb.includes('mode=thumbnail')) {
+      file.thumb = getProxyThumbnailUrl(origin, fid, 'url3', resolvedSurl);
+    }
+    
+    if (file.thumbs && typeof file.thumbs === 'object') {
+      for (const key of Object.keys(file.thumbs)) {
+        if (typeof file.thumbs[key] === 'string' && !file.thumbs[key].includes('mode=thumbnail')) {
+          file.thumbs[key] = getProxyThumbnailUrl(origin, fid, key, resolvedSurl);
+        }
+      }
+    }
+  };
+
+  if (Array.isArray(obj.list)) {
+    obj.list.forEach(file => processFile(file, obj.share_id || surl));
+  }
+  
+  if (obj.data) {
+    if (Array.isArray(obj.data.list)) {
+      obj.data.list.forEach(file => processFile(file, obj.data.share_id || surl));
+    } else if (typeof obj.data === 'object') {
+      processFile(obj.data, surl);
+    }
+  }
+  
+  return obj;
+}
+
+function buildResolvedRecord(surl, share, file, storedAt, requestUrl) {
   if (!share || !file) return null;
 
+  const fid = file.fs_id || file.fid || null;
+  let thumbUrl = file.thumbs?.url3 || file.thumbs?.url2 || file.thumbs?.url1 || file.thumb || null;
+  if (fid && requestUrl) {
+    const origin = new URL(requestUrl).origin;
+    thumbUrl = getProxyThumbnailUrl(origin, fid, 'url3', surl);
+  }
+
   return {
-    name: file.server_filename || null,
+    name: file.server_filename || file.name || null,
     dlink: file.dlink || null,
     size: toOptionalNumber(file.size),
-    time: toOptionalNumber(file.server_mtime),
+    time: toOptionalNumber(file.server_mtime || file.time),
     original_url: `https://terabox.app/s/${surl}`,
-    thumb: file.thumbs?.url3 || file.thumbs?.url2 || file.thumbs?.url1 || null,
+    thumb: thumbUrl,
     uk: share.uk || null,
     shareid: share.shareid || share.share_id || null,
-    fid: file.fs_id || null,
+    fid: fid,
     stored_at: storedAt ?? null,
     last_verified: storedAt ?? null
   };
 }
 
-function buildResolvedRecordFromDb(surl, shareData) {
+function buildResolvedRecordFromDb(surl, shareData, requestUrl) {
   const file = shareData?.list?.[0];
   const storedAt = shareData?.updated_at
     ? Math.floor(new Date(shareData.updated_at).getTime() / 1000)
     : null;
 
-  return buildResolvedRecord(surl, shareData, file, storedAt);
+  return buildResolvedRecord(surl, shareData, file, storedAt, requestUrl);
 }
 
-function buildResolvedRecordFromUpstream(surl, upstream) {
+function buildResolvedRecordFromUpstream(surl, upstream, requestUrl) {
   const file = upstream?.list?.[0];
   const now = Math.floor(Date.now() / 1000);
 
@@ -134,7 +193,8 @@ function buildResolvedRecordFromUpstream(surl, upstream) {
       shareid: upstream?.shareid || upstream?.share_id || null
     },
     file,
-    now
+    now,
+    requestUrl
   );
 }
 
@@ -240,16 +300,17 @@ export async function handleResolve(request, params, env) {
         const isExpired = storedAt && (now - storedAt > 8 * 3600); // 8 hours TTL
 
         if (!isExpired) {
-          const responseData = raw ? d1Data : buildResolvedRecordFromDb(surl, d1Data);
+          const responseData = raw ? d1Data : buildResolvedRecordFromDb(surl, d1Data, request.url);
           const hasDlink = raw
             ? d1Data.list?.some(f => f.dlink) || false
             : !!responseData?.dlink;
 
           if (responseData) {
+            const finalData = raw ? rewriteResponseThumbnails(responseData, request.url, surl) : responseData;
             return Response.json({
               source: 'd1',
               ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-              data: responseData
+              data: finalData
             });
           }
         }
@@ -380,14 +441,15 @@ export async function handleResolve(request, params, env) {
 
   if (raw) {
     const hasDlink = upstream.list?.some(f => f.dlink) || false;
+    const rewrittenUpstream = rewriteResponseThumbnails(upstream, request.url, surl);
     return Response.json({
       source: 'live',
       ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-      upstream
+      upstream: rewrittenUpstream
     });
   }
 
-  const record = buildResolvedRecordFromUpstream(surl, upstream);
+  const record = buildResolvedRecordFromUpstream(surl, upstream, request.url);
   return Response.json({
     source: 'live',
     ...(!record?.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
@@ -437,7 +499,7 @@ export async function handleStream(request, params, env) {
     try {
       const cachedShare = await getShareFromDb(env.sharedfile, surl);
       if (cachedShare) {
-        record = buildResolvedRecordFromDb(surl, cachedShare);
+        record = buildResolvedRecordFromDb(surl, cachedShare, request.url);
       }
     } catch (err) {
       console.error('D1 stream cache check error:', err);
@@ -684,14 +746,17 @@ export async function handleLookup(request, params, env) {
         .all();
 
       const thumbsObj = {};
+      const origin = new URL(request.url).origin;
       thumbs.results.forEach(t => {
-        thumbsObj[t.thumbnail_type] = t.url;
+        thumbsObj[t.thumbnail_type] = getProxyThumbnailUrl(origin, fid, t.thumbnail_type, file.share_id);
       });
+
+      const thumbUrl = thumbsObj.url3 || thumbsObj.url2 || thumbsObj.url1 || null;
 
       return Response.json({
         source: 'd1',
         ...(!file.dlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-        data: { ...file, thumbs: thumbsObj }
+        data: { ...file, thumb: thumbUrl, thumbs: thumbsObj }
       });
     }
 
@@ -702,11 +767,12 @@ export async function handleLookup(request, params, env) {
       return errorJson(404, 'Share not found in D1. Use mode=resolve first.', 'not_found', { surl });
     }
 
-    const hasDlink = shareData.list?.some(f => f.dlink) || false;
+    const rewrittenShareData = rewriteResponseThumbnails(shareData, request.url, surl);
+    const hasDlink = rewrittenShareData.list?.some(f => f.dlink) || false;
     return Response.json({
       source: 'd1',
       ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-      data: shareData
+      data: rewrittenShareData
     });
   } catch (err) {
     console.error('D1 lookup error:', err);
@@ -1038,7 +1104,7 @@ export async function handleAdminKvEntry(request, params, env) {
 
   try {
     const shareData = await getShareFromDb(env.sharedfile, surl);
-    const record = buildResolvedRecordFromDb(surl, shareData);
+    const record = buildResolvedRecordFromDb(surl, shareData, request.url);
     if (!record) {
       return errorJson(404, 'Cached entry not found', 'not_found', { surl });
     }
