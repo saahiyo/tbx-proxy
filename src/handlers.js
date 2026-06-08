@@ -5,16 +5,66 @@
 import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, errorJson, isValidSurl, normalizeSurl } from './utils.js';
 import { rewriteM3U8 } from './m3u8.js';
 import { storeUpstreamData, getShareFromDb } from './db.js';
+const UPSTREAM_DOMAINS = [
+  'terabox.app',
+  'www.terabox.app',
+  'www.terabox.com',
+  'www.1024tera.com',
+  'teraboxurl.com',
+  'www.teraboxurl.com',
+  'teraboxshare.com',
+  'www.teraboxshare.com',
+  'terasharelink.com',
+  'www.terasharelink.com',
+  '1024terabox.com',
+  'www.1024terabox.com'
+];
 
 function isTransientStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
-async function fetchWithTimeout(url, options, timeoutMs = 8000) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const fetchOptions = {
+    ...options,
+    redirect: 'manual',
+    signal: controller.signal
+  };
+
+  let currentUrl = url.toString();
+  let redirectsFollowed = 0;
+  const maxRedirects = 5;
+
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    while (true) {
+      console.log(`[fetchWithTimeout] Fetching: ${currentUrl}`);
+      console.log(`[fetchWithTimeout] Cookie header: ${fetchOptions.headers?.Cookie || fetchOptions.headers?.cookie || 'none'}`);
+      
+      const res = await fetch(currentUrl, fetchOptions);
+      console.log(`[fetchWithTimeout] Response status: ${res.status}`);
+
+      // Check for manual redirect follow to preserve cookies/headers
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('Location');
+        console.log(`[fetchWithTimeout] Redirecting to Location: ${location}`);
+        if (!location) {
+          return res;
+        }
+
+        if (redirectsFollowed >= maxRedirects) {
+          throw new Error('Too many redirects followed in manual redirect handler');
+        }
+
+        currentUrl = new URL(location, currentUrl).toString();
+        redirectsFollowed++;
+        continue;
+      }
+
+      return res;
+    }
   } finally {
     clearTimeout(timeoutId);
   }
@@ -96,24 +146,44 @@ export async function handlePage(request, params) {
   if (!surl) return badRequest('Missing surl');
   if (!isValidSurl(surl)) return badRequest('Invalid surl format');
 
-  const url = new URL('https://www.terabox.app/sharing/link');
-  url.searchParams.set('surl', surl);
+  let lastErr;
+  let htmlContent = null;
+  let successStatus = 200;
 
-  let res;
-  try {
-    res = await fetchWithTimeout(url, {
-      headers: buildHeaders(request, { Accept: 'text/html' }),
-      redirect: 'follow'
-    }, 8000);
-  } catch (err) {
-    const isAbort = err?.name === 'AbortError';
-    return errorJson(504, 'Upstream page request timed out', 'upstream_timeout', {
-      reason: isAbort ? 'timeout' : 'network_error'
+  for (const domain of UPSTREAM_DOMAINS) {
+    const url = new URL(`https://${domain}/sharing/link`);
+    url.searchParams.set('surl', surl);
+
+    try {
+      const res = await fetchWithTimeout(url, {
+        headers: buildHeaders(request, { Accept: 'text/html' }),
+        redirect: 'follow'
+      }, 8000);
+
+      if (res.ok) {
+        const text = await res.text();
+        if (!text.includes('need verify') && text.length > 500) {
+          htmlContent = text;
+          successStatus = res.status;
+          break;
+        }
+        lastErr = new Error(`Verification challenge or truncated HTML (${text.length} bytes) on domain ${domain}`);
+      } else {
+        lastErr = new Error(`Upstream status ${res.status} on domain ${domain}`);
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  if (htmlContent === null) {
+    return errorJson(502, 'All upstream domains failed or required verification', 'upstream_failed_all', {
+      reason: lastErr?.message || 'unknown'
     });
   }
 
-  return new Response(await res.text(), {
-    status: res.status,
+  return new Response(htmlContent, {
+    status: successStatus,
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
 }
@@ -191,36 +261,44 @@ export async function handleResolve(request, params, env) {
 
 
 
-  const pageUrl = new URL('https://www.terabox.app/sharing/link');
-  pageUrl.searchParams.set('surl', surl);
+  let pageRes = null;
+  let html = '';
+  let jsToken = null;
+  let lastErr = null;
 
-  let pageRes;
-  try {
-    pageRes = await fetchWithRetry(pageUrl.toString(), {
-      headers: buildHeaders(request, { Accept: 'text/html' }),
-      redirect: 'follow'
-    }, 2, 200, 8000);
-  } catch (err) {
-    const isAbort = err?.name === 'AbortError';
-    return errorJson(
-      isAbort ? 504 : 502,
-      isAbort ? 'Upstream page request timed out' : 'Upstream page request failed',
-      isAbort ? 'upstream_timeout' : 'upstream_error',
-      err?.message || (isAbort ? 'timeout' : 'network_error')
-    );
+  for (const domain of UPSTREAM_DOMAINS) {
+    const pageUrl = new URL(`https://${domain}/sharing/link`);
+    pageUrl.searchParams.set('surl', surl);
+
+    try {
+      pageRes = await fetchWithRetry(pageUrl.toString(), {
+        headers: buildHeaders(request, { Accept: 'text/html' }),
+        redirect: 'follow'
+      }, 1, 200, 8000);
+
+      if (pageRes && pageRes.ok) {
+        html = await pageRes.text();
+        jsToken = extractJsToken(html);
+        if (jsToken && html.length > 500 && !html.includes('need verify')) {
+          break;
+        }
+        jsToken = null;
+        lastErr = new Error(`Verification challenge or invalid page on domain ${domain}`);
+      } else {
+        lastErr = new Error(`Upstream page request failed with status ${pageRes?.status} on domain ${domain}`);
+      }
+    } catch (err) {
+      lastErr = err;
+    }
   }
-
-  if (!pageRes.ok) {
-    return errorJson(502, 'Upstream page request failed', 'upstream_error', {
-      status: pageRes.status
-    });
-  }
-
-  const html = await pageRes.text();
-  const jsToken = extractJsToken(html);
 
   if (!jsToken) {
-    return errorJson(403, 'Failed to extract jsToken', 'token_extract_failed');
+    return errorJson(
+      403,
+      'Failed to extract jsToken across all candidate domains',
+      'token_extract_failed_all',
+      { reason: lastErr?.message || 'unknown' }
+    );
   }
 
   let apiRes;
@@ -288,7 +366,7 @@ export async function handleResolve(request, params, env) {
     });
   }
   if (!upstream?.list?.length) {
-    return errorJson(502, 'Empty share list from upstream', 'upstream_empty');
+    return errorJson(502, 'Empty share list from upstream', 'upstream_empty', upstream);
   }
 
   // Store complete data in D1 for persistence when configured.
