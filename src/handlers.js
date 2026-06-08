@@ -234,6 +234,40 @@ export async function handlePage(request, params) {
     } catch (err) {
       lastErr = err;
     }
+
+    // Anonymous fallback if cookie-based request was blocked or challenged
+    const hasCookies = !!request.headers.get('Cookie');
+    if (!htmlContent && hasCookies) {
+      try {
+        console.log(`[handlePage] Cookie-based request failed for ${domain}. Retrying anonymously...`);
+        const anonHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html'
+        };
+        const acceptLang = request.headers.get('Accept-Language');
+        if (acceptLang) anonHeaders['Accept-Language'] = acceptLang;
+
+        const res = await fetchWithTimeout(url, {
+          headers: anonHeaders,
+          redirect: 'follow'
+        }, 8000);
+
+        if (res.ok) {
+          const text = await res.text();
+          if (!text.includes('need verify') && text.length > 500) {
+            htmlContent = text;
+            successStatus = res.status;
+            break;
+          }
+          lastErr = new Error(`Verification challenge or truncated HTML (${text.length} bytes) on domain ${domain} (anonymous fallback)`);
+        } else {
+          lastErr = new Error(`Upstream status ${res.status} on domain ${domain} (anonymous fallback)`);
+        }
+      } catch (err) {
+        lastErr = err;
+      }
+    }
   }
 
   if (htmlContent === null) {
@@ -350,6 +384,40 @@ export async function handleResolve(request, params, env) {
       }
     } catch (err) {
       lastErr = err;
+    }
+
+    // Anonymous fallback if cookie-based request was blocked or challenged
+    const hasCookies = !!request.headers.get('Cookie');
+    if (!jsToken && hasCookies) {
+      try {
+        console.log(`[handleResolve] Cookie-based request failed for ${domain}. Retrying anonymously...`);
+        const anonHeaders = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept': 'text/html'
+        };
+        const acceptLang = request.headers.get('Accept-Language');
+        if (acceptLang) anonHeaders['Accept-Language'] = acceptLang;
+
+        pageRes = await fetchWithRetry(pageUrl.toString(), {
+          headers: anonHeaders,
+          redirect: 'follow'
+        }, 1, 200, 8000);
+
+        if (pageRes && pageRes.ok) {
+          html = await pageRes.text();
+          jsToken = extractJsToken(html);
+          if (jsToken && html.length > 500 && !html.includes('need verify')) {
+            break;
+          }
+          jsToken = null;
+          lastErr = new Error(`Verification challenge or invalid page on domain ${domain} (anonymous fallback)`);
+        } else {
+          lastErr = new Error(`Upstream page request failed with status ${pageRes?.status} on domain ${domain} (anonymous fallback)`);
+        }
+      } catch (err) {
+        lastErr = err;
+      }
     }
   }
 
