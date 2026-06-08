@@ -24,6 +24,31 @@ function isTransientStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
+function mergeCookies(currentCookieHeader, setCookieHeaders) {
+  const cookieMap = new Map();
+
+  if (currentCookieHeader) {
+    currentCookieHeader.split(';').forEach(c => {
+      const parts = c.split('=');
+      if (parts.length >= 2) {
+        cookieMap.set(parts[0].trim(), parts.slice(1).join('=').trim());
+      }
+    });
+  }
+
+  setCookieHeaders.forEach(sc => {
+    const firstPart = sc.split(';')[0];
+    const parts = firstPart.split('=');
+    if (parts.length >= 2) {
+      cookieMap.set(parts[0].trim(), parts.slice(1).join('=').trim());
+    }
+  });
+
+  return Array.from(cookieMap.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -37,6 +62,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   let currentUrl = url.toString();
   let redirectsFollowed = 0;
   const maxRedirects = 5;
+  const visitedUrls = new Set([currentUrl]);
 
   try {
     while (true) {
@@ -58,7 +84,33 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
           throw new Error('Too many redirects followed in manual redirect handler');
         }
 
-        currentUrl = new URL(location, currentUrl).toString();
+        const nextUrl = new URL(location, currentUrl).toString();
+        if (visitedUrls.has(nextUrl)) {
+          console.warn(`[fetchWithTimeout] Redirect loop detected: ${nextUrl} already visited. Stopping.`);
+          return res;
+        }
+
+        // Extract and merge Set-Cookie headers from redirect response
+        let setCookies = [];
+        if (typeof res.headers.getSetCookie === 'function') {
+          setCookies = res.headers.getSetCookie();
+        } else {
+          const rawSetCookie = res.headers.get('Set-Cookie');
+          if (rawSetCookie) setCookies = [rawSetCookie];
+        }
+
+        if (setCookies.length > 0) {
+          const currentCookie = fetchOptions.headers?.Cookie || fetchOptions.headers?.cookie || '';
+          const newCookie = mergeCookies(currentCookie, setCookies);
+          if (newCookie) {
+            if (!fetchOptions.headers) fetchOptions.headers = {};
+            fetchOptions.headers.Cookie = newCookie;
+            delete fetchOptions.headers.cookie; // Normalize casing
+          }
+        }
+
+        currentUrl = nextUrl;
+        visitedUrls.add(currentUrl);
         redirectsFollowed++;
         continue;
       }
