@@ -1289,20 +1289,28 @@ export async function handleThumbnail(request, params, env) {
     return null;
   };
 
-  // 3. Try fetching using the cached thumbnail URL in D1 first
-  let cachedThumb = null;
+  // 3. Try fetching using the cached thumbnail URL in D1 first (preferring highest quality: url3 > url2 > url1 > icon)
+  let cachedUrl = null;
   try {
-    cachedThumb = await env.sharedfile
-      .prepare('SELECT url FROM thumbnails WHERE fs_id = ? AND thumbnail_type = ?')
-      .bind(fid, size)
-      .first();
+    const rows = await env.sharedfile
+      .prepare('SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?')
+      .bind(fid)
+      .all();
+    
+    if (rows?.results && rows.results.length > 0) {
+      const thumbsMap = {};
+      rows.results.forEach(r => {
+        thumbsMap[r.thumbnail_type] = r.url;
+      });
+      cachedUrl = thumbsMap.url3 || thumbsMap.url2 || thumbsMap.url1 || thumbsMap.icon;
+    }
   } catch (err) {
     console.error('Database query error looking up thumbnail:', err);
   }
 
-  if (cachedThumb?.url) {
+  if (cachedUrl) {
     try {
-      const response = await fetchAndServeImage(cachedThumb.url);
+      const response = await fetchAndServeImage(cachedUrl);
       if (response) {
         return response;
       }
@@ -1329,20 +1337,28 @@ export async function handleThumbnail(request, params, env) {
     return resolveRes; // Return the resolve error (e.g. share deleted / verify needed)
   }
 
-  // 5. Query D1 again for the newly resolved signed URL
-  let freshThumb = null;
+  // 5. Query D1 again for the newly resolved signed URL and pick the best one
+  let freshUrl = null;
   try {
-    freshThumb = await env.sharedfile
-      .prepare('SELECT url FROM thumbnails WHERE fs_id = ? AND thumbnail_type = ?')
-      .bind(fid, size)
-      .first();
+    const rows = await env.sharedfile
+      .prepare('SELECT url, thumbnail_type FROM thumbnails WHERE fs_id = ?')
+      .bind(fid)
+      .all();
+    
+    if (rows?.results && rows.results.length > 0) {
+      const thumbsMap = {};
+      rows.results.forEach(r => {
+        thumbsMap[r.thumbnail_type] = r.url;
+      });
+      freshUrl = thumbsMap.url3 || thumbsMap.url2 || thumbsMap.url1 || thumbsMap.icon;
+    }
   } catch (err) {
     console.error('Database query error looking up fresh thumbnail:', err);
   }
 
-  if (freshThumb?.url) {
+  if (freshUrl) {
     try {
-      const response = await fetchAndServeImage(freshThumb.url);
+      const response = await fetchAndServeImage(freshUrl);
       if (response) {
         return response;
       }
