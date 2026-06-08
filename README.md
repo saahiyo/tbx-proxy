@@ -10,6 +10,7 @@ A Cloudflare Workers proxy for TeraBox file sharing. This service provides multi
 - **Stream Mode**: Get M3U8 playlists for video streaming
 - **Segment Mode**: Proxy video segments (with SSRF protection)
 - **Lookup Mode**: Query cached D1 data without hitting upstream
+- **Admin Analytics & DB Explorer**: Path-based routes to inspect stored data and analytics
 - **CORS Support**: Full cross-origin request support
 
 ## Project Structure
@@ -108,6 +109,8 @@ GET /?mode=resolve&surl=<shorturl>[&refresh=1][&raw=1]
 | `mode=resolve&surl=...&raw=1` | D1 → Upstream → Store in D1 |
 | `mode=resolve&surl=...&refresh=1` | Upstream → Store |
 
+> ℹ️ **Note on `raw=1` Output:** If `raw=1` results in a cache hit (source is `d1`), the raw data is returned in the `"data"` field. If it results in a cache miss (source is `live`), the raw data is returned in the `"upstream"` field.
+
 **Response:**
 ```json
 {
@@ -155,7 +158,7 @@ GET /?mode=lookup&fid=<file_id>
 ---
 
 #### Mode: `stream`
-Returns an M3U8 playlist using cached metadata. Requires calling `mode=resolve` first.
+Returns an M3U8 playlist using cached metadata. If the metadata is not yet cached in D1, the worker will automatically resolve and cache it from upstream in the background (though calling `mode=resolve` beforehand is recommended to reduce initial latency).
 
 ```
 GET /?mode=stream&surl=<shorturl>[&type=<quality>]
@@ -180,9 +183,10 @@ GET /?mode=segment&url=<segment_url>
 - `url` (required) - Full segment URL to proxy (must be TeraBox domain)
 
 **Allowed Domains:**
-- `terabox.com`, `terabox.app`, `1024tera.com`, `1024terabox.com`
-- `teraboxcdn.com`, `terasharelink.com`, `terafileshare.com`
-- `teraboxlink.com`, `teraboxshare.com`
+- `terabox.com`, `terabox.app`, `1024tera.com`, `1024terabox.com`, `freeterabox.com`
+- `teraboxcdn.com`, `dm.terabox.app`, `dm.1024tera.com`
+- `terasharelink.com`, `terafileshare.com`, `terasharefile.com`
+- `teraboxlink.com`, `teraboxshare.com`, `teraboxurl.com`
 
 **Response:** Video segment data
 
@@ -194,6 +198,27 @@ Returns service health status.
 ```
 GET /?mode=health
 ```
+
+---
+
+## Admin Endpoints
+
+The worker exposes a set of path-based admin endpoints to query the database and check operational details.
+
+### Authentication
+If `ADMIN_KEY` is configured in `wrangler.toml` (under `[vars]`), requests to any `/admin/*` route must pass the key:
+- Via the query parameter `key`: `/admin/overview?key=YOUR_ADMIN_KEY`
+- Via the HTTP header `x-admin-key`: `x-admin-key: YOUR_ADMIN_KEY`
+
+### Route List:
+- `GET /admin/overview`: Statistics overview (counts of shares, files, thumbnails, and latest 20 shares).
+- `GET /admin/shares`: List of shares with pagination. Support query filtering (`q`), sorting (`sort`), and order (`order`).
+- `GET /admin/shares/:share_id`: Detailed information for a single share including associated media files.
+- `GET /admin/files`: List of files with size filtering (`size_min`/`size_max`), search (`q`), and share ID filtering.
+- `GET /admin/files/:fs_id`: Details of a specific media file.
+- `GET /admin/thumbnails`: Paginated search of database thumbnail records.
+- `GET /admin/analytics/processed`: Operational metrics grouped by day.
+- `GET /admin/kv/entry?surl=<surl>`: Direct resolved record query (fetches from D1).
 
 ---
 
@@ -275,22 +300,27 @@ npx wrangler deploy
 
 ## Error Handling
 
-All errors return JSON responses with CORS headers:
+All errors return JSON responses with CORS headers.
 
+**Response Schema:**
 ```json
 {
-  "error": "Error message",
-  "required": ["param1", "param2"]
+  "error": "Human readable error description",
+  "code": "error_code_string",
+  "details": "Optional network or exception details (if available)",
+  "required": ["list", "of", "missing", "params"]
 }
 ```
 
-**Common Status Codes:**
-- `400` - Bad Request (missing or invalid parameters)
-- `403` - Forbidden (failed to extract token or SSRF blocked)
-- `404` - Not Found (share not in cache)
-- `500` - Internal Server Error
-- `502` - Bad Gateway (upstream error)
-- `503` - Service Unavailable (D1 not configured)
+**Common Status Codes & Codes:**
+* `400` / `bad_request`: Missing or invalid query parameter.
+* `401` / `unauthorized`: Missing or incorrect admin key credential on `/admin` paths.
+* `403` / `token_extract_failed` or `invalid_segment_url`: Failed to extract jsToken from share page, or SSRF domain check blocked the segment URL.
+* `404` / `not_found`: Database record lookup failed.
+* `500` / `incomplete_metadata` or `db_error` or `internal_error`: Missing database columns, query exceptions, or script failures.
+* `502` / `upstream_error` or `upstream_non_json` or `upstream_empty`: Upstream TeraBox page/API returned non-2xx status, failed to return JSON, or returned an empty file list.
+* `503` / `d1_unavailable`: D1 binding is not configured.
+* `504` / `upstream_timeout`: Upstream fetch operation timed out (exceeded 8-second execution limit).
 
 ## Example Workflows
 

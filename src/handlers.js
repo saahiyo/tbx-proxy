@@ -2,7 +2,7 @@
  * Request handlers for different modes: page, api, resolve, stream, segment
  */
 
-import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, errorJson } from './utils.js';
+import { buildHeaders, extractJsToken, buildApiUrl, badRequest, jsonUpstream, errorJson, isValidSurl, normalizeSurl } from './utils.js';
 import { rewriteM3U8 } from './m3u8.js';
 import { storeUpstreamData, getShareFromDb } from './db.js';
 
@@ -92,8 +92,9 @@ function buildResolvedRecordFromUpstream(surl, upstream) {
  * Handle page mode - fetches the share page
  */
 export async function handlePage(request, params) {
-  const surl = params.get('surl');
+  const surl = normalizeSurl(params.get('surl'));
   if (!surl) return badRequest('Missing surl');
+  if (!isValidSurl(surl)) return badRequest('Invalid surl format');
 
   const url = new URL('https://www.terabox.app/sharing/link');
   url.searchParams.set('surl', surl);
@@ -122,9 +123,10 @@ export async function handlePage(request, params) {
  */
 export async function handleApi(request, params) {
   const jsToken = params.get('jsToken');
-  const shorturl = params.get('shorturl');
+  const shorturl = normalizeSurl(params.get('shorturl'));
   if (!jsToken || !shorturl)
     return badRequest('Missing jsToken or shorturl', ['jsToken', 'shorturl']);
+  if (!isValidSurl(shorturl)) return badRequest('Invalid shorturl format');
 
   const apiUrl = buildApiUrl(jsToken, shorturl, '1');
 
@@ -150,27 +152,36 @@ export async function handleApi(request, params) {
  * Handle resolve mode - extract metadata and cache in D1 when available
  */
 export async function handleResolve(request, params, env) {
-  const surl = params.get('surl');
+  const surl = normalizeSurl(params.get('surl'));
   const refresh = params.get('refresh') === '1';
   const raw = params.get('raw') === '1';
 
   if (!surl) return badRequest('Missing surl');
+  if (!isValidSurl(surl)) return badRequest('Invalid surl format');
 
   if (!refresh && env.sharedfile) {
     try {
       const d1Data = await getShareFromDb(env.sharedfile, surl);
       if (d1Data) {
-        const responseData = raw ? d1Data : buildResolvedRecordFromDb(surl, d1Data);
-        const hasDlink = raw
-          ? d1Data.list?.some(f => f.dlink) || false
-          : !!responseData?.dlink;
+        const storedAt = d1Data.updated_at
+          ? Math.floor(new Date(d1Data.updated_at).getTime() / 1000)
+          : null;
+        const now = Math.floor(Date.now() / 1000);
+        const isExpired = storedAt && (now - storedAt > 8 * 3600); // 8 hours TTL
 
-        if (responseData) {
-          return Response.json({
-            source: 'd1',
-            ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
-            data: responseData
-          });
+        if (!isExpired) {
+          const responseData = raw ? d1Data : buildResolvedRecordFromDb(surl, d1Data);
+          const hasDlink = raw
+            ? d1Data.list?.some(f => f.dlink) || false
+            : !!responseData?.dlink;
+
+          if (responseData) {
+            return Response.json({
+              source: 'd1',
+              ...(!hasDlink && { note: 'dlink requires valid TeraBox cookies to download' }),
+              data: responseData
+            });
+          }
         }
       }
     } catch (err) {
@@ -178,16 +189,7 @@ export async function handleResolve(request, params, env) {
     }
   }
 
-  // Fetch fresh from upstream
-  const apiHeaders = buildHeaders(request, {
-    Accept: 'application/json',
-    Referer: 'https://terabox.com/'
-  });
 
-  async function fetchApiWithToken(jsToken) {
-    const apiUrl = buildApiUrl(jsToken, surl, '1');
-    return fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200, 8000);
-  }
 
   const pageUrl = new URL('https://www.terabox.app/sharing/link');
   pageUrl.searchParams.set('surl', surl);
@@ -223,7 +225,44 @@ export async function handleResolve(request, params, env) {
 
   let apiRes;
   try {
-    apiRes = await fetchApiWithToken(jsToken);
+    // Extract Set-Cookie headers from page response
+    let setCookies = [];
+    if (typeof pageRes.headers.getSetCookie === 'function') {
+      setCookies = pageRes.headers.getSetCookie();
+    } else {
+      const rawSetCookie = pageRes.headers.get('Set-Cookie');
+      if (rawSetCookie) setCookies = [rawSetCookie];
+    }
+
+    // Merge incoming request cookies with cookies set by the page fetch
+    const incomingCookie = request.headers.get('Cookie');
+    let mergedCookie = incomingCookie;
+    if (setCookies.length > 0) {
+      const cookiesObj = {};
+      if (incomingCookie) {
+        incomingCookie.split(';').forEach(c => {
+          const parts = c.split('=');
+          if (parts.length >= 2) cookiesObj[parts[0].trim()] = parts.slice(1).join('=').trim();
+        });
+      }
+      setCookies.forEach(sc => {
+        const firstPart = sc.split(';')[0];
+        const parts = firstPart.split('=');
+        if (parts.length >= 2) cookiesObj[parts[0].trim()] = parts.slice(1).join('=').trim();
+      });
+      mergedCookie = Object.entries(cookiesObj).map(([k, v]) => `${k}=${v}`).join('; ');
+    }
+
+    const apiHeaders = buildHeaders(request, {
+      Accept: 'application/json',
+      Referer: 'https://terabox.com/'
+    });
+    if (mergedCookie) {
+      apiHeaders.Cookie = mergedCookie;
+    }
+
+    const apiUrl = buildApiUrl(jsToken, surl, '1');
+    apiRes = await fetchWithRetry(apiUrl, { headers: apiHeaders }, 2, 200, 8000);
   } catch (err) {
     const isAbort = err?.name === 'AbortError';
     return errorJson(
@@ -305,11 +344,14 @@ function getStreamAuthFromDlink(dlink) {
  * Handle stream mode - returns M3U8 playlist using cached metadata
  */
 export async function handleStream(request, params, env) {
-  const surl = params.get('surl');
+  const surl = normalizeSurl(params.get('surl'));
   const type = params.get('type') || 'M3U8_AUTO_360';
 
   if (!surl) {
     return badRequest('Missing surl', ['surl']);
+  }
+  if (!isValidSurl(surl)) {
+    return badRequest('Invalid surl format');
   }
 
   let record = null;
@@ -324,7 +366,10 @@ export async function handleStream(request, params, env) {
     }
   }
 
-  if (!hasStreamMetadata(record)) {
+  const now = Math.floor(Date.now() / 1000);
+  const isExpired = record?.stored_at && (now - record.stored_at > 8 * 3600); // 8 hours TTL
+
+  if (!hasStreamMetadata(record) || isExpired) {
     const resolveParams = new URLSearchParams(params);
     resolveParams.delete('raw');
     resolveParams.set('refresh', '1');
@@ -525,11 +570,17 @@ export async function handleSegment(request, params) {
  * Supports lookup by share ID (surl) or file ID (fid)
  */
 export async function handleLookup(request, params, env) {
-  const surl = params.get('surl');
+  const surl = normalizeSurl(params.get('surl'));
   const fid = params.get('fid');
 
   if (!surl && !fid) {
     return badRequest('Missing surl or fid parameter', ['surl', 'fid']);
+  }
+  if (surl && !isValidSurl(surl)) {
+    return badRequest('Invalid surl format');
+  }
+  if (fid && !/^\d+$/.test(fid)) {
+    return badRequest('Invalid fid format');
   }
 
   if (!env.sharedfile) {
@@ -679,7 +730,9 @@ export async function handleAdminShares(request, params, env) {
 }
 
 export async function handleAdminShareDetail(request, params, env, shareId) {
+  shareId = normalizeSurl(shareId);
   if (!shareId) return badRequest('Missing share_id');
+  if (!isValidSurl(shareId)) return badRequest('Invalid share_id format');
   const missing = requireD1(env);
   if (missing) return missing;
 
@@ -742,7 +795,8 @@ export async function handleAdminFiles(request, params, env) {
   if (missing) return missing;
 
   const q = params.get('q')?.trim();
-  const shareId = params.get('share_id')?.trim();
+  const shareId = normalizeSurl(params.get('share_id')?.trim());
+  if (shareId && !isValidSurl(shareId)) return badRequest('Invalid share_id format');
   const sizeMin = params.get('size_min');
   const sizeMax = params.get('size_max');
   const sort = normalizeSort(params.get('sort'), ['server_mtime', 'size', 'server_filename'], 'server_mtime');
@@ -798,6 +852,7 @@ export async function handleAdminFiles(request, params, env) {
 
 export async function handleAdminFileDetail(request, params, env, fsId) {
   if (!fsId) return badRequest('Missing fs_id');
+  if (!/^\d+$/.test(fsId)) return badRequest('Invalid fs_id format');
   const missing = requireD1(env);
   if (missing) return missing;
 
@@ -831,6 +886,7 @@ export async function handleAdminThumbnails(request, params, env) {
   if (missing) return missing;
 
   const fsId = params.get('fs_id')?.trim();
+  if (fsId && !/^\d+$/.test(fsId)) return badRequest('Invalid fs_id format');
   const type = params.get('type')?.trim();
   const page = parsePositiveInt(params.get('page'), 1);
   const pageSize = clamp(parsePositiveInt(params.get('pageSize'), 50), 1, 200);
@@ -898,8 +954,9 @@ export async function handleAdminKvEntry(request, params, env) {
   const missing = requireD1(env);
   if (missing) return missing;
 
-  const surl = params.get('surl');
+  const surl = normalizeSurl(params.get('surl'));
   if (!surl) return badRequest('Missing surl');
+  if (!isValidSurl(surl)) return badRequest('Invalid surl format');
 
   try {
     const shareData = await getShareFromDb(env.sharedfile, surl);

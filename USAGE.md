@@ -52,7 +52,7 @@ curl "https://tbx-proxy.shakir-ansarii075.workers.dev/?mode=stream&surl=YOUR_SHO
 
 ## All Modes
 
-| Mode | Purpose | Required Params |
+| Mode / Path | Purpose | Required Params / Headers |
 |------|---------|-----------------|
 | `resolve` | Extract & cache metadata | `surl` |
 | `lookup` | Query D1 cache (fast) | `surl` or `fid` |
@@ -61,6 +61,7 @@ curl "https://tbx-proxy.shakir-ansarii075.workers.dev/?mode=stream&surl=YOUR_SHO
 | `api` | Direct API call | `jsToken`, `shorturl` |
 | `segment` | Proxy video segments | `url` |
 | `health` | Service health check | none |
+| `/admin/*` | Admin analytics & DB inspection | `key` param or `x-admin-key` header |
 
 ---
 
@@ -92,13 +93,17 @@ curl ".../?mode=resolve&surl=abc123"
 curl ".../?mode=resolve&surl=abc123"
 # Response: {"source": "d1", "data": {...}}
 
-# Get full data from D1 cache
+# Get full data from D1 cache (raw=1 cache hit returns data)
 curl ".../?mode=resolve&surl=abc123&raw=1"
 # Response: {"source": "d1", "data": {...}}
 
-# Force fresh fetch
+# Force fresh raw fetch (raw=1 cache miss/live returns upstream)
+curl ".../?mode=resolve&surl=abc123&raw=1&refresh=1"
+# Response: {"source": "live", "upstream": {...}}
+
+# Force fresh fetch (normal)
 curl ".../?mode=resolve&surl=abc123&refresh=1"
-# Response: {"source": "live", ...}
+# Response: {"source": "live", "data": {...}}
 ```
 
 ---
@@ -141,7 +146,7 @@ curl ".../?mode=lookup&fid=511133506523791"
 
 ## Mode: `stream`
 
-Returns M3U8 playlist for video playback. **Requires calling `resolve` first.**
+Returns M3U8 playlist for video playback. If the share metadata is not yet cached in D1, the worker will automatically resolve and cache it from upstream in the background (though calling `resolve` beforehand is recommended to reduce initial latency).
 
 **Required:**
 - `surl` - Same short URL from resolve
@@ -165,7 +170,7 @@ Proxies video segments. Called automatically by M3U8 playlist.
 **Security:** Only allows TeraBox domains (SSRF protected).
 
 **Allowed Domains:**
-`terabox.com`, `terabox.app`, `1024tera.com`, `1024terabox.com`, `teraboxcdn.com`, `terasharelink.com`, `terafileshare.com`, `teraboxlink.com`, `teraboxshare.com`
+`terabox.com`, `terabox.app`, `1024tera.com`, `1024terabox.com`, `freeterabox.com`, `teraboxcdn.com`, `dm.terabox.app`, `dm.1024tera.com`, `terasharelink.com`, `terafileshare.com`, `teraboxlink.com`, `teraboxshare.com`, `terasharefile.com`, `teraboxurl.com`
 
 ---
 
@@ -226,14 +231,26 @@ curl -o video.mp4 "$DLINK"
 
 ## Error Codes
 
-| Code | Error | Fix |
-|------|-------|-----|
-| 400 | Missing parameter | Check required params |
-| 403 | Token extraction failed / SSRF blocked | Share may be private or URL not allowed |
-| 404 | Not in cache | Call `mode=resolve` first |
-| 500 | Incomplete metadata | Try `refresh=1` |
-| 502 | Upstream error | TeraBox API may be down |
-| 503 | D1 not configured | Check wrangler.toml |
+Standard error responses follow this JSON schema:
+```json
+{
+  "error": "Error message details",
+  "code": "error_code_string",
+  "details": "Optional additional debugging/network information",
+  "required": ["optional", "param", "list"]
+}
+```
+
+| HTTP Status | Error Code (`code`) | Description / Fix |
+|-------------|---------------------|-------------------|
+| 400 | `bad_request` | Missing or invalid parameter |
+| 401 | `unauthorized` | Missing or invalid `key` / `x-admin-key` header on admin routes |
+| 403 | `token_extract_failed` / `invalid_segment_url` | Failed to extract jsToken or SSRF segment URL blocked |
+| 404 | `not_found` | Share or file not cached in D1 |
+| 500 | `incomplete_metadata` / `db_error` / `internal_error` | Missing stream metadata or internal exceptions |
+| 502 | `upstream_error` / `upstream_non_json` / `upstream_empty` | TeraBox API is down or returned invalid data |
+| 503 | `d1_unavailable` | D1 database not bound/configured |
+| 504 | `upstream_timeout` | The upstream TeraBox requests timed out (8s limit) |
 
 ---
 
@@ -255,9 +272,82 @@ curl -o video.mp4 "$DLINK"
 
 ---
 
+## Admin Endpoints
+
+The proxy includes path-based admin endpoints to inspect database records and analytics. All requests require authentication if `ADMIN_KEY` is configured in `wrangler.toml`. Pass the key using either:
+- The `key` query parameter: `?key=YOUR_ADMIN_KEY`
+- The `x-admin-key` request header: `x-admin-key: YOUR_ADMIN_KEY`
+
+### Endpoints:
+
+#### 1. Overview
+Get overall counts of shares, files, thumbnails, and the 20 most recently updated shares.
+* **Path:** `GET /admin/overview`
+* **Response:** `{ "counts": { "shares": 10, "media_files": 42, "thumbnails": 168 }, "latestShares": [...] }`
+
+#### 2. Shares List
+List and search stored shares.
+* **Path:** `GET /admin/shares`
+* **Query Params:**
+  * `q` (optional): Filter by share ID, title, or user ID (uk)
+  * `sort` (optional): Sort by `updated_at`, `server_time`, or `title` (default: `updated_at`)
+  * `order` (optional): `asc` or `desc` (default: `desc`)
+  * `page` (optional): Page number (default: `1`)
+  * `pageSize` (optional): Items per page, max 200 (default: `50`)
+* **Response:** `{ "page": 1, "pageSize": 50, "total": 12, "items": [...] }`
+
+#### 3. Share Details
+Get full detail of a share, pagination of its media files, and thumbnails.
+* **Path:** `GET /admin/shares/:share_id`
+* **Query Params:**
+  * `page` (optional): Page number of media files (default: `1`)
+  * `pageSize` (optional): Files per page (default: `50`)
+* **Response:** `{ "share": {...}, "files": [...], "thumbsByFsId": {...}, "page": 1, "pageSize": 50, "totalFiles": 10 }`
+
+#### 4. Media Files List
+List and filter files.
+* **Path:** `GET /admin/files`
+* **Query Params:**
+  * `q` (optional): Search by file name or file system ID (`fs_id`)
+  * `share_id` (optional): Filter files in a specific share
+  * `size_min` / `size_max` (optional): Filter files by size limits (in bytes)
+  * `sort` (optional): Sort by `server_mtime`, `size`, or `server_filename` (default: `server_mtime`)
+  * `order` (optional): `asc` or `desc` (default: `desc`)
+  * `page` / `pageSize` (optional)
+* **Response:** `{ "page": 1, "pageSize": 50, "total": 10, "items": [...] }`
+
+#### 5. File Details
+Get details of a specific file and its thumbnails.
+* **Path:** `GET /admin/files/:fs_id`
+* **Response:** `{ "file": {...}, "thumbs": { "url1": "...", "url2": "..." } }`
+
+#### 6. Thumbnails List
+Search thumbnails.
+* **Path:** `GET /admin/thumbnails`
+* **Query Params:**
+  * `fs_id` (optional): Filter by file system ID
+  * `type` (optional): Filter by thumbnail type (`url1`, `url2`, `url3`, `icon`)
+  * `page` / `pageSize` (optional)
+* **Response:** `{ "page": 1, "pageSize": 50, "total": 150, "items": [...] }`
+
+#### 7. Analytics: Processed Links
+Get the count of resolved shares grouped by day.
+* **Path:** `GET /admin/analytics/processed`
+* **Query Params:**
+  * `limit` (optional): Number of days of history, max 180 (default: `30`)
+* **Response:** `{ "limit": 30, "items": [{ "day": "2026-06-08", "shares": 5 }, ...] }`
+
+#### 8. Cache Record Entry Lookup
+Retrieve a resolved record for a specific short URL from D1.
+* **Path:** `GET /admin/kv/entry` (Note: queries D1 database)
+* **Query Params:**
+  * `surl` (required): TeraBox short URL
+* **Response:** `{ "surl": "...", "data": { "name": "...", "dlink": "..." } }`
+
+---
+
 ## Need Help?
 
 - **Worker not deployed?** Run `npx wrangler deploy`
 - **D1 not configured?** Check `wrangler.toml`
 - **Getting 500 errors?** Try with `&raw=1` to see full response
-- **Link expired?** Use `&refresh=1` to re-fetch

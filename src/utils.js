@@ -3,7 +3,9 @@
  */
 
 export function extractJsToken(html) {
-  return findBetween(html, 'fn%28%22', '%22%29');
+  // Matches fn%28%22<token>%22%29 or fn%28%27<token>%27%29 or raw function calls
+  const match = html.match(/fn(?:%28|\()(?:%22|%27|["'])([^%'"\(\)]+)(?:%22|%27|["'])(?:%29|\))/);
+  return match ? match[1] : null;
 }
 
 export function findBetween(str, start, end) {
@@ -25,10 +27,15 @@ export function buildApiUrl(jsToken, shorturl, root) {
 export function buildHeaders(request, extra = {}) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    'Accept-Language': 'en-US,en;q=0.9',
     ...extra
   };
   const cookie = request.headers.get('Cookie');
   if (cookie) headers.Cookie = cookie;
+
+  const acceptLang = request.headers.get('Accept-Language');
+  if (acceptLang) headers['Accept-Language'] = acceptLang;
+
   return headers;
 }
 
@@ -63,6 +70,14 @@ export async function jsonUpstream(res, message = 'Upstream request failed') {
   }
 
   return errorJson(502, 'Upstream returned non-JSON', 'upstream_non_json', { status: res.status });
+}
+
+export function normalizeSurl(surl) {
+  if (!surl || typeof surl !== 'string') return surl;
+  if (surl.length === 23 && surl.startsWith('1')) {
+    return surl.slice(1);
+  }
+  return surl;
 }
 
 /**

@@ -34,3 +34,6 @@ CREATE TABLE IF NOT EXISTS thumbnails (
   url TEXT,
   thumbnail_type TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_media_files_share_id ON media_files(share_id);
+CREATE INDEX IF NOT EXISTS idx_thumbnails_fs_id ON thumbnails(fs_id);
