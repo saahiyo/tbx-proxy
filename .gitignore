@@ -14,3 +14,5 @@ test_endpoints.py
 debug_page.html
 
 shareids.txt
+junk_shares.txt
+valid_shares.txt
